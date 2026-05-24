@@ -1,18 +1,17 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
+use web_time::Instant;
 
+use crate::http::{HttpRequest, SharedHttpClient, collect_stream_to_string};
+use crate::streaming::should_flush_delta;
 use crate::{
     AgentProvider, AgentProviderKind, AssistantTurn, ChatMessage, EventSink, MessageRole,
     RuntimeEvent, ToolCall, ToolDefinition,
 };
-use crate::streaming::should_flush_delta;
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -33,19 +32,23 @@ impl Default for AnthropicClientConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicClient {
-    http_client: Client,
+    http_client: SharedHttpClient,
     api_key: String,
     config: AnthropicClientConfig,
 }
 
 impl AnthropicClient {
-    pub fn new(http_client: Client, api_key: impl Into<String>) -> Self {
+    pub fn new(http_client: SharedHttpClient, api_key: impl Into<String>) -> Self {
         Self::with_config(http_client, api_key, AnthropicClientConfig::default())
     }
 
-    pub fn with_verbose(http_client: Client, api_key: impl Into<String>, verbose: bool) -> Self {
+    pub fn with_verbose(
+        http_client: SharedHttpClient,
+        api_key: impl Into<String>,
+        verbose: bool,
+    ) -> Self {
         Self {
             http_client,
             api_key: api_key.into(),
@@ -57,7 +60,7 @@ impl AnthropicClient {
     }
 
     pub fn with_config(
-        http_client: Client,
+        http_client: SharedHttpClient,
         api_key: impl Into<String>,
         config: AnthropicClientConfig,
     ) -> Self {
@@ -105,27 +108,26 @@ impl AnthropicClient {
             request_payload.insert("tool_choice".to_string(), json!({ "type": "auto" }));
         }
 
-        let response = self
-            .http_client
-            .post(ANTHROPIC_MESSAGES_URL)
+        let request = HttpRequest::post(ANTHROPIC_MESSAGES_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&Value::Object(request_payload))
-            .send()
+            .json_body(&Value::Object(request_payload))?;
+        let response = self
+            .http_client
+            .send(request)
             .await
             .context("failed to call Anthropic assistant with tools")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        if !response.is_success() {
+            let status = response.status;
             let body = response
                 .text()
-                .await
                 .unwrap_or_else(|_| "<failed to read response body>".to_string());
             if self.verbose() {
                 warn!(
                     model = %model,
                     duration_ms = request_started_at.elapsed().as_millis() as u64,
-                    status = %status,
+                    status,
                     body = %body,
                     "assistant turn request failed"
                 );
@@ -135,7 +137,6 @@ impl AnthropicClient {
 
         let body: AnthropicMessageResponse = response
             .json()
-            .await
             .context("failed to decode Anthropic assistant response")?;
         let assistant_turn = assistant_turn_from_anthropic_content(&body.content)?;
 
@@ -190,27 +191,24 @@ impl AnthropicClient {
             "messages": anthropic_messages,
         });
 
-        let response = self
-            .http_client
-            .post(ANTHROPIC_MESSAGES_URL)
+        let request = HttpRequest::post(ANTHROPIC_MESSAGES_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&request_payload)
-            .send()
+            .json_body(&request_payload)?;
+        let response = self
+            .http_client
+            .send_streaming(request)
             .await
             .context("failed to call Anthropic streaming messages API")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        if !(200..300).contains(&response.status) {
+            let status = response.status;
+            let body = collect_stream_to_string(response.body).await;
             if self.verbose() {
                 warn!(
                     model = %model,
                     duration_ms = request_started_at.elapsed().as_millis() as u64,
-                    status = %status,
+                    status,
                     body = %body,
                     "streamed assistant message request failed"
                 );
@@ -218,7 +216,7 @@ impl AnthropicClient {
             return Err(anyhow!("Anthropic streamed message returned {status}: {body}"));
         }
 
-        let mut response_stream = response.bytes_stream();
+        let mut response_stream = response.body;
         let mut raw_event_buffer = String::new();
         let mut full_message = String::new();
         let mut pending_delta = String::new();

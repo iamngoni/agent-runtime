@@ -1,7 +1,8 @@
-use anyhow::{Context, Result};
-use reqwest::Client;
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
+
+use crate::http::{HttpClient, SharedHttpClient};
 use crate::{
     AgentProvider, AgentProviderKind, AnthropicClient, AssistantTurn, ChatMessage, EventSink,
     OpenAiClient, ToolDefinition, ToolSessionOutcome, ToolSessionRequest, execute_tool_session,
@@ -12,9 +13,9 @@ pub struct AgentConfig {
     pub verbose: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AgentBuilder {
-    http_client: Option<Client>,
+    http_client: Option<SharedHttpClient>,
     provider: AgentProviderKind,
     api_key: Option<String>,
     config: AgentConfig,
@@ -84,8 +85,30 @@ impl Agent {
 }
 
 impl AgentBuilder {
-    pub fn http_client(mut self, http_client: Client) -> Self {
+    /// Plug in a custom HTTP backend (Cloudflare Worker, browser, mock…).
+    /// The builder defaults to a `reqwest`-backed client when the
+    /// `reqwest-http` feature is enabled.
+    pub fn http_client(mut self, http_client: SharedHttpClient) -> Self {
         self.http_client = Some(http_client);
+        self
+    }
+
+    /// Convenience for the common case of building an [`Arc`] from a concrete
+    /// HTTP client. Equivalent to `.http_client(Arc::new(client))`.
+    pub fn with_http_client<C>(mut self, http_client: C) -> Self
+    where
+        C: HttpClient + 'static,
+    {
+        self.http_client = Some(Arc::new(http_client));
+        self
+    }
+
+    /// Compatibility shim: accept a raw `reqwest::Client` and wrap it in the
+    /// default [`ReqwestHttpClient`](crate::ReqwestHttpClient) backend. Only
+    /// available when the `reqwest-http` feature is on.
+    #[cfg(feature = "reqwest-http")]
+    pub fn reqwest_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(crate::ReqwestHttpClient::new(client).into_shared());
         self
     }
 
@@ -109,7 +132,10 @@ impl AgentBuilder {
             "agent builder requires an API key for {}",
             self.provider.as_str()
         ))?;
-        let http_client = self.http_client.unwrap_or_default();
+        let http_client = match self.http_client {
+            Some(client) => client,
+            None => default_http_client()?,
+        };
         let provider: Arc<dyn AgentProvider> = match self.provider {
             AgentProviderKind::OpenAi => Arc::new(OpenAiClient::with_verbose(
                 http_client,
@@ -130,6 +156,19 @@ impl AgentBuilder {
     }
 }
 
+#[cfg(feature = "reqwest-http")]
+fn default_http_client() -> Result<SharedHttpClient> {
+    Ok(crate::ReqwestHttpClient::default().into_shared())
+}
+
+#[cfg(not(feature = "reqwest-http"))]
+fn default_http_client() -> Result<SharedHttpClient> {
+    anyhow::bail!(
+        "no HTTP backend configured: enable the `reqwest-http` feature or call \
+         `AgentBuilder::http_client(...)` with a custom impl"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -137,6 +176,7 @@ mod tests {
     use super::Agent;
     use crate::AgentProviderKind;
 
+    #[cfg(feature = "reqwest-http")]
     #[test]
     fn builder_defaults_to_non_verbose() -> Result<()> {
         let agent = Agent::builder().api_key("test-key").build()?;
@@ -145,6 +185,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "reqwest-http")]
     #[test]
     fn builder_can_enable_verbose_logging() -> Result<()> {
         let agent = Agent::builder().api_key("test-key").verbose(true).build()?;
@@ -152,6 +193,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "reqwest-http")]
     #[test]
     fn builder_can_select_anthropic_provider() -> Result<()> {
         let agent = Agent::builder()

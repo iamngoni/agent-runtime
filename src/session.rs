@@ -1,6 +1,5 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result};
+use web_time::Instant;
 use tracing::info;
 
 use crate::{

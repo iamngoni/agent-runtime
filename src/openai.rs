@@ -1,18 +1,17 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
+use web_time::Instant;
 
+use crate::http::{HttpRequest, SharedHttpClient, collect_stream_to_string};
+use crate::streaming::should_flush_delta;
 use crate::{
     AgentProvider, AgentProviderKind, AssistantTurn, ChatMessage, EventSink, MessageRole,
     RuntimeEvent, ToolCall, ToolDefinition,
 };
-use crate::streaming::should_flush_delta;
 
 const OPENAI_CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
 
@@ -21,19 +20,23 @@ pub struct OpenAiClientConfig {
     pub verbose: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiClient {
-    http_client: Client,
+    http_client: SharedHttpClient,
     api_key: String,
     config: OpenAiClientConfig,
 }
 
 impl OpenAiClient {
-    pub fn new(http_client: Client, api_key: impl Into<String>) -> Self {
+    pub fn new(http_client: SharedHttpClient, api_key: impl Into<String>) -> Self {
         Self::with_config(http_client, api_key, OpenAiClientConfig::default())
     }
 
-    pub fn with_verbose(http_client: Client, api_key: impl Into<String>, verbose: bool) -> Self {
+    pub fn with_verbose(
+        http_client: SharedHttpClient,
+        api_key: impl Into<String>,
+        verbose: bool,
+    ) -> Self {
         Self {
             http_client,
             api_key: api_key.into(),
@@ -42,7 +45,7 @@ impl OpenAiClient {
     }
 
     pub fn with_config(
-        http_client: Client,
+        http_client: SharedHttpClient,
         api_key: impl Into<String>,
         config: OpenAiClientConfig,
     ) -> Self {
@@ -93,26 +96,25 @@ impl OpenAiClient {
             request_payload.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
 
+        let request = HttpRequest::post(OPENAI_CHAT_COMPLETIONS_URL)
+            .bearer_auth(&self.api_key)
+            .json_body(&Value::Object(request_payload))?;
         let response = self
             .http_client
-            .post(OPENAI_CHAT_COMPLETIONS_URL)
-            .bearer_auth(&self.api_key)
-            .json(&Value::Object(request_payload))
-            .send()
+            .send(request)
             .await
             .context("failed to call OpenAI assistant with tools")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        if !response.is_success() {
+            let status = response.status;
             let body = response
                 .text()
-                .await
                 .unwrap_or_else(|_| "<failed to read response body>".to_string());
             if self.verbose() {
                 warn!(
                     model = %model,
                     duration_ms = request_started_at.elapsed().as_millis() as u64,
-                    status = %status,
+                    status,
                     body = %body,
                     "assistant turn request failed"
                 );
@@ -122,7 +124,6 @@ impl OpenAiClient {
 
         let body: ToolChatCompletionResponse = response
             .json()
-            .await
             .context("failed to decode OpenAI assistant tool response")?;
 
         let assistant_turn: AssistantTurn = body
@@ -186,26 +187,23 @@ impl OpenAiClient {
             "messages": all_messages,
         });
 
+        let request = HttpRequest::post(OPENAI_CHAT_COMPLETIONS_URL)
+            .bearer_auth(&self.api_key)
+            .json_body(&request_payload)?;
         let response = self
             .http_client
-            .post(OPENAI_CHAT_COMPLETIONS_URL)
-            .bearer_auth(&self.api_key)
-            .json(&request_payload)
-            .send()
+            .send_streaming(request)
             .await
             .context("failed to call OpenAI chat completions for tool follow-up")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        if !(200..300).contains(&response.status) {
+            let status = response.status;
+            let body = collect_stream_to_string(response.body).await;
             if self.verbose() {
                 warn!(
                     model = %model,
                     duration_ms = request_started_at.elapsed().as_millis() as u64,
-                    status = %status,
+                    status,
                     body = %body,
                     "streamed assistant message request failed"
                 );
@@ -213,7 +211,7 @@ impl OpenAiClient {
             return Err(anyhow!("OpenAI tool follow-up returned {status}: {body}"));
         }
 
-        let mut response_stream = response.bytes_stream();
+        let mut response_stream = response.body;
         let mut raw_event_buffer = String::new();
         let mut full_message = String::new();
         let mut pending_delta = String::new();
