@@ -7,7 +7,7 @@ A small, runtime-agnostic LLM agent core in Rust. Handles the boring bits — pr
 The crate runs on:
 
 - **Native** (tokio, axum, reqwest) — default, via the built-in `reqwest` backend.
-- **Cloudflare Workers / wasm32-unknown-unknown** — plug in a `worker::Fetch`-backed `HttpClient` impl and the same `Agent` runs unchanged inside a Worker.
+- **Cloudflare Workers / wasm32-unknown-unknown** — plug in a `worker::Fetch`-backed `HttpClient` impl and the same agent runs unchanged inside a Worker.
 - **Anywhere else with an HTTP client** — implement the `HttpClient` trait and you're in.
 
 ## Why
@@ -28,53 +28,109 @@ For a Worker (or any other wasm target), turn the reqwest backend off and bring 
 agent-runtime = { git = "...", default-features = false }
 ```
 
-## Quick start (native, default features)
+## Two concepts: `Llm` and `Agent`
+
+- **`Llm`** is *how to reach a model* — provider, API key, transport, retries. It has no instructions or tools.
+- **`Agent`** is *the thing with identity* — instructions, an (optional) model, and tools. You declare it once and bind it to an `Llm` at call time.
 
 ```rust
-use agent_runtime::{Agent, AgentProviderKind, ChatMessage};
+use agent_runtime::{Agent, AgentProviderKind, Llm};
 
-let agent = Agent::builder()
+// 1. An Llm handle.
+let llm = Llm::builder()
     .provider(AgentProviderKind::Anthropic)
     .api_key(std::env::var("ANTHROPIC_API_KEY")?)
     .build()?;
 
-let reply = agent
-    .request_assistant_turn(
-        "claude-haiku-4-5-20251001",
-        "You are a helpful assistant.",
-        &[ChatMessage::user("Hello")],
-        &[],
-    )
-    .await?;
+// 2. A declarative agent (only `instructions` is required).
+struct Helpful;
+impl Agent for Helpful {
+    fn instructions(&self) -> String { "You are concise and helpful.".into() }
+}
 
-println!("{}", reply.content.unwrap_or_default());
+// 3. Run it — the whole tool session is hidden behind `run`.
+let reply = llm.run(&Helpful, "What is the capital of Zimbabwe?").await?;
+println!("{reply}");
 ```
 
 The default `ReqwestHttpClient` is wired automatically when the `reqwest-http` feature is on (it is, by default).
+
+## Defining an agent
+
+`Agent` requires only `instructions`; `model`, `tools`, and `max_tool_calls` have
+defaults you override as needed. Tools use the unit context, so each tool owns
+its own state — the agent stays self-contained.
+
+```rust
+use agent_runtime::{Agent, JsonTool, ToolRegistry};
+use serde::Deserialize;
+use schemars::JsonSchema;
+use serde_json::json;
+
+#[derive(Deserialize, JsonSchema)]
+struct AddItem { name: String }
+
+struct Cashier { cart: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+
+impl Agent for Cashier {
+    fn instructions(&self) -> String {
+        "You are a cashier. Add each item, then check out.".into()
+    }
+    fn model(&self) -> String { "gpt-4o".into() }      // empty => Llm's default tier
+    fn tools(&self) -> ToolRegistry<()> {
+        let cart = self.cart.clone();
+        let mut r = ToolRegistry::new();
+        r.register(JsonTool::new("add_to_cart", "Add an item", move |_ctx: (), a: AddItem| {
+            let cart = cart.clone();
+            async move { cart.lock().unwrap().push(a.name.clone()); Ok(json!({ "ok": true })) }
+        }));
+        r
+    }
+}
+
+// let reply = llm.run(&cashier, "two lattes and an espresso, then check out").await?;
+```
+
+`run` has siblings: `run_with_history(agent, &history, input)` for memory, and
+`run_stream(agent, &history, input, &mut sink)` to stream tokens. Need a shared,
+typed tool context instead of `()`? Drop to `llm.execute_tool_session(...)`.
+
+## Examples
+
+Runnable, in [`examples/`](examples/) — `cargo run --example <name>`:
+
+| Example | Shows |
+|---|---|
+| [`01_quickstart`](examples/01_quickstart.rs) | Llm + one-line agent + `run` |
+| [`02_streaming`](examples/02_streaming.rs) | Streaming tokens via an `EventSink` |
+| [`03_tools_cashier`](examples/03_tools_cashier.rs) | A declarative agent with stateful tools |
+| [`04_subagents`](examples/04_subagents.rs) | Agents-as-tools delegation |
+| [`05_attachments`](examples/05_attachments.rs) | Image/document multimodal input |
+| [`06_conversation`](examples/06_conversation.rs) | Multi-turn memory via `ConversationStore` |
 
 ## Choosing a provider
 
 Named vendors carry their own default base URL and model tiers — just pick one:
 
 ```rust
-use agent_runtime::{Agent, AgentProviderKind, ModelTier};
+use agent_runtime::{AgentProviderKind, Llm, ModelTier};
 
 // Groq, DeepSeek, xAI, Mistral, Ollama, OpenRouter all work the same way —
 // they speak the OpenAI wire format, so they reuse one client.
-let agent = Agent::builder()
+let llm = Llm::builder()
     .provider(AgentProviderKind::Groq)
     .api_key(std::env::var("GROQ_API_KEY")?)
     .build()?;
 
 // Ask for a capability tier instead of hardcoding a model string:
-let model = agent.model_for(ModelTier::Smartest); // -> "llama-3.3-70b-versatile"
+let model = llm.model_for(ModelTier::Smartest); // -> "llama-3.3-70b-versatile"
 ```
 
 Any other OpenAI-compatible endpoint (self-hosted vLLM/LiteLLM, a vendor without
 a preset) goes through the escape hatch — supply a name and base URL:
 
 ```rust
-let agent = Agent::builder()
+let llm = Llm::builder()
     .openai_compatible("local-vllm", "http://localhost:8000/v1")
     .api_key("…")
     .model_tiers(agent_runtime::ModelTiers::new("my-model", "my-model", "my-model"))
@@ -85,7 +141,7 @@ let agent = Agent::builder()
 Google Gemini has its own native client (distinct wire format) but the same builder API:
 
 ```rust
-let agent = Agent::builder()
+let llm = Llm::builder()
     .provider(AgentProviderKind::Gemini)
     .api_key(std::env::var("GEMINI_API_KEY")?)
     .build()?;
@@ -101,7 +157,7 @@ backoff with a `RetryPolicy` (default is no retries):
 ```rust
 use agent_runtime::RetryPolicy;
 
-let agent = Agent::builder()
+let llm = Llm::builder()
     .provider(AgentProviderKind::OpenAi)
     .api_key("…")
     .retry(RetryPolicy::with_retries(3)) // exponential backoff on retryable errors
@@ -167,22 +223,33 @@ Expose a specialised agent to another agent as a callable tool — the parent
 delegates a self-contained task and gets the sub-agent's answer back as the tool
 result. The sub-agent runs in isolation (no access to the parent conversation).
 
+When the parent delegates, the sub-agent runs its **own full session** (its own
+tools included) via `Llm::run` — so a `RefundsAgent` that needs to hit a payments
+API actually does.
+
 ```rust
-use agent_runtime::{AgentTool, ToolRegistry};
+use agent_runtime::{Agent, AgentTool, ToolRegistry};
 
-let refunds_agent = Agent::builder()
-    .provider(AgentProviderKind::OpenAi).api_key(key.clone()).build()?;
+// A sub-agent is just another declarative Agent.
+struct RefundsAgent;
+impl Agent for RefundsAgent {
+    fn instructions(&self) -> String { "You process customer refunds.".into() }
+}
 
-let mut registry = ToolRegistry::<MyContext>::new();
-registry.register(AgentTool::new(
-    "refunds_agent",
-    "Delegates refund handling to a specialist sub-agent",
-    refunds_agent,
-    "gpt-4o",
-    "You process customer refunds.",
-));
-// The parent now calls `refunds_agent` like any other tool in a tool session.
+// Expose it as a tool inside the parent agent's `tools()`:
+fn parent_tools(llm: Llm) -> ToolRegistry<()> {
+    let mut registry = ToolRegistry::new();
+    registry.register(AgentTool::new(
+        "refunds",
+        "Delegates refund handling to a specialist sub-agent",
+        llm,            // runs the sub-agent
+        RefundsAgent,
+    ));
+    registry
+}
 ```
+
+See [`examples/04_subagents.rs`](examples/04_subagents.rs) for the full version.
 
 ## Quick start (Cloudflare Worker)
 
@@ -244,7 +311,7 @@ fn convert(m: HttpMethod) -> Method {
 }
 
 // Then:
-let agent = Agent::builder()
+let llm = Llm::builder()
     .provider(AgentProviderKind::Anthropic)
     .api_key(env.secret("ANTHROPIC_API_KEY")?.to_string())
     .http_client(Arc::new(WorkerHttpClient))
@@ -255,7 +322,7 @@ let agent = Agent::builder()
 
 ## Streaming
 
-Both providers stream via `agent.stream_message(...)`. You pass an `EventSink` and tokens land via `RuntimeEvent::AssistantDelta { delta }` as the model produces them. A built-in `should_flush_delta` helper batches deltas at sentence breaks if you want chunky output.
+Stream via the high-level `llm.run_stream(&agent, &history, input, &mut sink)`, or the low-level `llm.stream_message(...)`. You pass an `EventSink` and tokens land via `RuntimeEvent::AssistantDelta { delta }` as the model produces them. A built-in `should_flush_delta` helper batches deltas at sentence breaks if you want chunky output.
 
 ```rust
 use agent_runtime::{EventSink, RuntimeEvent};
@@ -272,12 +339,12 @@ impl EventSink for PrintSink {
     }
 }
 
-agent.stream_message(model, system, &messages, &mut PrintSink).await?;
+llm.stream_message(model, system, &messages, &mut PrintSink).await?;
 ```
 
 ## Tool calling
 
-`ToolRegistry<C>` holds tools keyed by name; `Tool` and `JsonTool` are the two impls. `Agent::execute_tool_session(...)` runs a single tool-using turn end to end: ask the LLM, dispatch any tool calls it requests, return the final natural-language answer.
+`ToolRegistry<C>` holds tools keyed by name; `Tool` and `JsonTool` are the two impls. The high-level `llm.run(&agent, input)` drives this from an agent's `tools()`. For full control, `Llm::execute_tool_session(...)` runs a single tool-using turn end to end: ask the LLM, dispatch any tool calls it requests, return the final natural-language answer.
 
 ```rust
 use agent_runtime::{JsonTool, ToolRegistry, ToolSessionRequest};
@@ -290,7 +357,7 @@ registry.register(JsonTool::new(
     |ctx, input: SearchInput| async move { /* … */ Ok(json!({ "results": [...] })) },
 ));
 
-let outcome = agent
+let outcome = llm
     .execute_tool_session(
         ToolSessionRequest {
             model: "claude-sonnet-4-5-20250929",
@@ -310,15 +377,16 @@ let outcome = agent
 
 | Flag | Default | Effect |
 |---|---|---|
-| `reqwest-http` | on | Pulls in `reqwest` + `rustls-tls`; provides `ReqwestHttpClient` and the `AgentBuilder::reqwest_client(Client)` compat helper. Turn off for wasm. |
+| `reqwest-http` | on | Pulls in `reqwest` + `rustls-tls`; provides `ReqwestHttpClient` and the `LlmBuilder::reqwest_client(Client)` compat helper. Turn off for wasm. |
 
 ## Architecture
 
 ```
-                              AgentBuilder
-                                   │
-                              (Agent)
-                                   │
+        Agent (trait: instructions + tools)        your declarative agents
+                    │  bound at call time via llm.run(&agent, input)
+                    ▼
+                   Llm  ── LlmBuilder (provider + key + retry)
+                    │
               Capability traits (a provider implements what it supports)
         ┌────────────────────┬──────────────────────────┐
         │                    │                           │
@@ -346,7 +414,7 @@ OpenAiClient   AnthropicClient      GeminiClient          │
 - **One client, many vendors:** `OpenAiClient` is parameterised by base URL + headers, so Groq/DeepSeek/xAI/Mistral/Ollama/OpenRouter/custom all reuse the same wire code. Anthropic and Gemini have native clients.
 - `HttpClient` is the transport seam. Two methods: `send` (buffered) and `send_streaming` (chunked).
 - `ProviderError` + `RetryPolicy` classify failures and drive optional backoff/failover.
-- `Agent` is a thin facade over a provider, used directly or via `execute_tool_session` for tool loops.
+- **`Llm` vs `Agent`:** `Llm` is the configured provider handle (was the old `Agent`); `Agent` is the declarative trait (instructions + tools). `llm.run(&agent, input)` binds them and hides the tool session. Drop to `llm.execute_tool_session(...)` for full control.
 - `EventSink` is the streaming-progress callback. Implement `emit` to ship deltas wherever (stdout, SSE, websocket).
 
 ## Status
@@ -361,6 +429,7 @@ OpenAiClient   AnthropicClient      GeminiClient          │
 - ✅ Image & document attachments (multimodal input)
 - ✅ Conversation memory (`ConversationStore` seam + in-memory impl)
 - ✅ Sub-agent delegation (agents as tools)
+- ✅ Declarative `Agent` trait + `llm.run()` runner (instructions + tools, boilerplate-free)
 - ✅ Typed provider errors + retry/backoff
 - ✅ Multi-step tool sessions
 - ✅ Native + wasm32 (Cloudflare Workers verified)
@@ -371,4 +440,4 @@ OpenAiClient   AnthropicClient      GeminiClient          │
 
 ## License
 
-UNLICENSED — internal use.
+[MIT](LICENSE) © Ngonidzashe Mangudya

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_runtime::{
     Agent, AgentProviderKind, AgentTool, ChatMessage, EventSink, HttpByteStream, HttpClient,
-    HttpRequest, HttpResponse, HttpStreamResponse, JsonTool, RetryPolicy, RuntimeEvent,
+    HttpRequest, HttpResponse, HttpStreamResponse, JsonTool, Llm, RetryPolicy, RuntimeEvent,
     ToolRegistry, ToolSessionOutcome, ToolSessionRequest,
 };
 use anyhow::Result;
@@ -117,13 +117,13 @@ struct EchoArgs {
     text: String,
 }
 
-fn build_agent(mock: MockHttpClient) -> Agent {
-    Agent::builder()
+fn build_llm(mock: MockHttpClient) -> Llm {
+    Llm::builder()
         .provider(AgentProviderKind::OpenAi)
         .api_key("test-key")
         .with_http_client(mock)
         .build()
-        .expect("agent builds")
+        .expect("llm builds")
 }
 
 #[tokio::test]
@@ -137,7 +137,7 @@ async fn streams_assistant_deltas_and_emits_events() -> Result<()> {
             "data: [DONE]\n\n",
         ),
     );
-    let agent = build_agent(mock);
+    let agent = build_llm(mock);
 
     let mut sink = RecordingSink::default();
     let message = agent
@@ -178,7 +178,7 @@ async fn runs_a_full_tool_session_end_to_end() -> Result<()> {
         200,
         "data: {\"choices\":[{\"delta\":{\"content\":\"echoed: ping\"}}]}\n\ndata: [DONE]\n\n",
     );
-    let agent = build_agent(mock.clone());
+    let agent = build_llm(mock.clone());
 
     let mut registry = ToolRegistry::<()>::new();
     registry.register(JsonTool::new(
@@ -232,7 +232,7 @@ async fn retries_retryable_errors_then_succeeds() -> Result<()> {
         json!({ "choices": [{ "message": { "content": "ok" } }] }).to_string(),
     );
 
-    let agent = Agent::builder()
+    let agent = Llm::builder()
         .provider(AgentProviderKind::OpenAi)
         .api_key("test-key")
         .with_http_client(mock.clone())
@@ -246,6 +246,72 @@ async fn retries_retryable_errors_then_succeeds() -> Result<()> {
     assert_eq!(turn.content.as_deref(), Some("ok"));
     assert_eq!(mock.request_count(), 2); // one retry
     Ok(())
+}
+
+/// A declarative agent with its own tool, exercised through `Llm::run`.
+struct CashierAgent;
+
+impl Agent for CashierAgent {
+    fn instructions(&self) -> String {
+        "You are a cashier. Use tools to ring up items.".into()
+    }
+    fn model(&self) -> String {
+        "gpt-4o".into()
+    }
+    fn tools(&self) -> ToolRegistry<()> {
+        let mut r = ToolRegistry::new();
+        r.register(JsonTool::new(
+            "echo",
+            "Echo text",
+            |_ctx: (), args: EchoArgs| async move { Ok(json!({ "echoed": args.text })) },
+        ));
+        r
+    }
+}
+
+#[tokio::test]
+async fn high_level_run_drives_a_declarative_agent() -> Result<()> {
+    let mock = MockHttpClient::new();
+    // Decision turn asks for the echo tool…
+    mock.push_buffered(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "echo", "arguments": "{\"text\":\"latte\"}" }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+    // …then the synthesis stream.
+    mock.push_stream(
+        200,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Rang up: latte\"}}]}\n\ndata: [DONE]\n\n",
+    );
+
+    let llm = build_llm(mock);
+    // The whole tool session is hidden behind one call:
+    let reply = llm.run(&CashierAgent, "ring up a latte").await?;
+    assert_eq!(reply, "Rang up: latte");
+    Ok(())
+}
+
+/// A declarative sub-agent the parent can delegate to.
+struct RefundsAgent;
+
+impl Agent for RefundsAgent {
+    fn instructions(&self) -> String {
+        "You process customer refunds.".into()
+    }
+    fn model(&self) -> String {
+        "gpt-4o".into()
+    }
 }
 
 #[tokio::test]
@@ -271,10 +337,11 @@ async fn parent_agent_delegates_to_sub_agent() -> Result<()> {
         })
         .to_string(),
     );
-    // 2) Sub-agent's streamed answer (AgentTool drives stream_message).
-    mock.push_stream(
+    // 2) Sub-agent runs its own session (no tools) → one buffered direct turn.
+    mock.push_buffered(
         200,
-        "data: {\"choices\":[{\"delta\":{\"content\":\"Refund issued for order 42\"}}]}\n\ndata: [DONE]\n\n",
+        json!({ "choices": [{ "message": { "content": "Refund issued for order 42" } }] })
+            .to_string(),
     );
     // 3) Parent's follow-up synthesis after the delegation result.
     mock.push_stream(
@@ -282,16 +349,15 @@ async fn parent_agent_delegates_to_sub_agent() -> Result<()> {
         "data: {\"choices\":[{\"delta\":{\"content\":\"Done: refunded\"}}]}\n\ndata: [DONE]\n\n",
     );
 
-    let parent = build_agent(mock.clone());
-    let refunds_agent = build_agent(mock.clone());
+    let parent = build_llm(mock.clone());
+    let refunds_llm = build_llm(mock.clone());
 
     let mut registry = ToolRegistry::<()>::new();
     registry.register(AgentTool::new(
         "refunds_agent",
         "Delegates refund handling to a specialist sub-agent",
-        refunds_agent,
-        "gpt-4o",
-        "You process customer refunds.",
+        refunds_llm,
+        RefundsAgent,
     ));
 
     let mut sink = RecordingSink::default();
@@ -326,7 +392,7 @@ async fn parent_agent_delegates_to_sub_agent() -> Result<()> {
         }
         ToolSessionOutcome::Direct { .. } => panic!("expected delegation to run"),
     }
-    // 3 upstream calls: parent decision + sub-agent stream + parent synthesis.
+    // 3 upstream calls: parent decision + sub-agent turn + parent synthesis.
     assert_eq!(mock.request_count(), 3);
     Ok(())
 }
@@ -335,7 +401,7 @@ async fn parent_agent_delegates_to_sub_agent() -> Result<()> {
 async fn surfaces_non_retryable_errors() -> Result<()> {
     let mock = MockHttpClient::new();
     mock.push_buffered(400, "bad request");
-    let agent = build_agent(mock.clone());
+    let agent = build_llm(mock.clone());
 
     let result = agent
         .request_assistant_turn("gpt-4o", "sys", &[ChatMessage::user("hi")], &[])

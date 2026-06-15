@@ -7,6 +7,7 @@ mod error;
 mod event;
 mod gemini;
 mod http;
+mod llm;
 mod message;
 mod openai;
 mod provider;
@@ -15,7 +16,8 @@ mod store;
 mod streaming;
 mod tool;
 
-pub use agent::{Agent, AgentBuilder, AgentConfig};
+pub use agent::Agent;
+pub use llm::{Llm, LlmBuilder, LlmConfig};
 pub use anthropic::{
     AnthropicClient, AnthropicClientConfig, AnthropicParsedStreamEvent,
     parse_anthropic_stream_event,

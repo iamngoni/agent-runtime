@@ -35,6 +35,24 @@ pub enum ToolSessionOutcome {
     },
 }
 
+impl ToolSessionOutcome {
+    /// The final natural-language message, regardless of whether tools ran.
+    pub fn message(&self) -> &str {
+        match self {
+            ToolSessionOutcome::Direct { message, .. }
+            | ToolSessionOutcome::ToolBacked { message, .. } => message,
+        }
+    }
+
+    /// Consume the outcome, returning its final message.
+    pub fn into_message(self) -> String {
+        match self {
+            ToolSessionOutcome::Direct { message, .. }
+            | ToolSessionOutcome::ToolBacked { message, .. } => message,
+        }
+    }
+}
+
 pub async fn execute_tool_calls<C, E>(
     tool_registry: &ToolRegistry<C>,
     tool_context: C,

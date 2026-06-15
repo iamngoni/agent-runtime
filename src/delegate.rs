@@ -2,42 +2,41 @@
 //!
 //! Mirrors Laravel AI's pattern where an agent's `tools()` can include
 //! `new RefundsAgent` — a specialised sub-agent exposed to the parent as a
-//! callable tool. [`AgentTool`] wraps an [`Agent`] so it satisfies the
-//! [`Tool`] contract: the parent model calls it with a self-contained `task`
-//! string, the sub-agent answers in isolation (no access to the parent's
-//! conversation), and its reply is returned as the tool result.
+//! callable tool. [`AgentTool`] wraps a declarative [`Agent`] together with the
+//! [`Llm`] that runs it: the parent model calls it with a self-contained
+//! `task`, the sub-agent runs its **own full tool session** in isolation (no
+//! access to the parent conversation), and its reply is returned as the tool
+//! result.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::{Agent, ChatMessage, NullEventSink, Tool, ToolCall, ToolDefinition, ToolOutput};
+use crate::{Agent, Llm, Tool, ToolCall, ToolDefinition, ToolOutput};
 
 /// A sub-agent exposed to a parent agent as a tool.
 ///
-/// The sub-agent runs in isolation: it receives only the `task` the parent
-/// passes, runs against its own model + instructions, and returns its text
-/// answer. Register it in the parent's [`ToolRegistry`](crate::ToolRegistry)
-/// like any other tool.
+/// Register it in the parent's [`ToolRegistry`](crate::ToolRegistry) like any
+/// other tool. When the parent calls it, the wrapped agent runs via
+/// [`Llm::run`], so the sub-agent's own tools execute too.
 pub struct AgentTool<C> {
     definition: ToolDefinition,
-    agent: Agent,
-    model: String,
-    instructions: String,
+    llm: Llm,
+    agent: Arc<dyn Agent>,
     _marker: PhantomData<fn() -> C>,
 }
 
 impl<C> AgentTool<C> {
     /// Wrap `agent` as a delegatable tool. `name`/`description` are what the
-    /// parent model sees; `model`/`instructions` drive the sub-agent.
+    /// parent model sees; `llm` runs the sub-agent.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
-        agent: Agent,
-        model: impl Into<String>,
-        instructions: impl Into<String>,
+        llm: Llm,
+        agent: impl Agent + 'static,
     ) -> Self {
         let definition = ToolDefinition {
             name: name.into(),
@@ -56,9 +55,8 @@ impl<C> AgentTool<C> {
         };
         Self {
             definition,
-            agent,
-            model: model.into(),
-            instructions: instructions.into(),
+            llm,
+            agent: Arc::new(agent),
             _marker: PhantomData,
         }
     }
@@ -81,15 +79,9 @@ where
             .map(str::to_string)
             .unwrap_or_else(|| call.arguments.to_string());
 
-        let mut sink = NullEventSink;
         let response = self
-            .agent
-            .stream_message(
-                &self.model,
-                &self.instructions,
-                &[ChatMessage::user(task)],
-                &mut sink,
-            )
+            .llm
+            .run(self.agent.as_ref(), task)
             .await
             .with_context(|| {
                 format!("sub-agent delegation via tool '{}' failed", self.definition.name)
