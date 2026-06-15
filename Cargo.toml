@@ -1,6 +1,6 @@
 [package]
 name = "agent-runtime"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [features]
@@ -17,6 +17,22 @@ serde_json = "1"
 tracing = "0.1"
 # Cross-target time (uses std on native, JS Date on wasm32-unknown-unknown).
 web-time = "1"
+# Cross-target async delay for retry backoff. Works on native and wasm; only
+# invoked when a RetryPolicy with retries > 0 is configured (default is 0), so
+# wasm consumers that never opt into retries never touch a timer.
+futures-timer = "3"
 # Default HTTP backend for native targets. wasm consumers turn this off and
 # plug in their own HttpClient impl (e.g. one backed by `worker::Fetch`).
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
+
+[dev-dependencies]
+# Async test runtime for store + provider-flow tests (test-only; the library
+# itself stays runtime-agnostic).
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# Used by the mock HttpClient and flow tests in tests/.
+anyhow = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "0.8", features = ["derive"] }

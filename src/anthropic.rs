@@ -6,29 +6,42 @@ use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 use web_time::Instant;
 
-use crate::http::{HttpRequest, SharedHttpClient, collect_stream_to_string};
+use crate::error::{ProviderError, RetryPolicy, execute_with_retry};
+use crate::http::{HttpRequest, HttpResponse, SharedHttpClient, collect_stream_to_string};
+use crate::provider::{AgentProviderKind, ModelTiers, ProviderInfo, TextProvider};
 use crate::streaming::should_flush_delta;
-use crate::{
-    AgentProvider, AgentProviderKind, AssistantTurn, ChatMessage, EventSink, MessageRole,
-    RuntimeEvent, ToolCall, ToolDefinition,
-};
+use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
 
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct AnthropicClientConfig {
+    pub base_url: String,
     pub verbose: bool,
     pub max_tokens: u32,
+    pub model_tiers: ModelTiers,
+    pub retry: RetryPolicy,
 }
 
 impl Default for AnthropicClientConfig {
     fn default() -> Self {
         Self {
+            base_url: AgentProviderKind::Anthropic
+                .default_base_url()
+                .expect("anthropic has a default base url")
+                .to_string(),
             verbose: false,
             max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            model_tiers: AgentProviderKind::Anthropic.default_model_tiers(),
+            retry: RetryPolicy::default(),
         }
+    }
+}
+
+impl AnthropicClientConfig {
+    fn messages_url(&self) -> String {
+        format!("{}/messages", self.base_url.trim_end_matches('/'))
     }
 }
 
@@ -75,6 +88,39 @@ impl AnthropicClient {
         self.config.verbose
     }
 
+    fn provider_name(&self) -> &str {
+        AgentProviderKind::Anthropic.as_str()
+    }
+
+    fn prepare(&self, request: HttpRequest) -> HttpRequest {
+        request
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+    }
+
+    async fn send_classified(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
+        let name = self.provider_name();
+        execute_with_retry(&self.config.retry, || {
+            let request = request.clone();
+            async move {
+                let response = self
+                    .http_client
+                    .send(request)
+                    .await
+                    .map_err(|err| ProviderError::transport(name, err))?;
+                if response.is_success() {
+                    Ok(response)
+                } else {
+                    let body = response
+                        .text()
+                        .unwrap_or_else(|_| "<failed to read response body>".to_string());
+                    Err(ProviderError::from_status(name, response.status, body))
+                }
+            }
+        })
+        .await
+    }
+
     async fn request_assistant_turn_impl(
         &self,
         model: &str,
@@ -108,32 +154,13 @@ impl AnthropicClient {
             request_payload.insert("tool_choice".to_string(), json!({ "type": "auto" }));
         }
 
-        let request = HttpRequest::post(ANTHROPIC_MESSAGES_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+        let request = self
+            .prepare(HttpRequest::post(self.config.messages_url()))
             .json_body(&Value::Object(request_payload))?;
         let response = self
-            .http_client
-            .send(request)
+            .send_classified(request)
             .await
             .context("failed to call Anthropic assistant with tools")?;
-
-        if !response.is_success() {
-            let status = response.status;
-            let body = response
-                .text()
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
-            if self.verbose() {
-                warn!(
-                    model = %model,
-                    duration_ms = request_started_at.elapsed().as_millis() as u64,
-                    status,
-                    body = %body,
-                    "assistant turn request failed"
-                );
-            }
-            return Err(anyhow!("Anthropic assistant call returned {status}: {body}"));
-        }
 
         let body: AnthropicMessageResponse = response
             .json()
@@ -191,9 +218,8 @@ impl AnthropicClient {
             "messages": anthropic_messages,
         });
 
-        let request = HttpRequest::post(ANTHROPIC_MESSAGES_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+        let request = self
+            .prepare(HttpRequest::post(self.config.messages_url()))
             .json_body(&request_payload)?;
         let response = self
             .http_client
@@ -213,7 +239,7 @@ impl AnthropicClient {
                     "streamed assistant message request failed"
                 );
             }
-            return Err(anyhow!("Anthropic streamed message returned {status}: {body}"));
+            return Err(ProviderError::from_status(self.provider_name(), status, body).into());
         }
 
         let mut response_stream = response.body;
@@ -301,16 +327,22 @@ impl AnthropicClient {
     }
 }
 
-#[async_trait]
-impl AgentProvider for AnthropicClient {
+impl ProviderInfo for AnthropicClient {
     fn kind(&self) -> AgentProviderKind {
         AgentProviderKind::Anthropic
     }
 
     fn verbose(&self) -> bool {
-        self.verbose()
+        self.config.verbose
     }
 
+    fn model_tiers(&self) -> &ModelTiers {
+        &self.config.model_tiers
+    }
+}
+
+#[async_trait]
+impl TextProvider for AnthropicClient {
     async fn request_assistant_turn(
         &self,
         model: &str,
@@ -418,10 +450,12 @@ fn messages_to_anthropic_json(messages: &[ChatMessage]) -> Result<Vec<Value>> {
                 index += 1;
             }
             MessageRole::User => {
-                converted.push(json!({
-                    "role": "user",
-                    "content": message.content.clone().unwrap_or_default(),
-                }));
+                let content = if message.has_attachments() {
+                    Value::Array(anthropic_user_content_blocks(message))
+                } else {
+                    Value::String(message.content.clone().unwrap_or_default())
+                };
+                converted.push(json!({ "role": "user", "content": content }));
                 index += 1;
             }
             MessageRole::Assistant => {
@@ -455,6 +489,37 @@ fn messages_to_anthropic_json(messages: &[ChatMessage]) -> Result<Vec<Value>> {
     }
 
     Ok(converted)
+}
+
+/// Build Anthropic's content blocks (text + image/document) for a user message
+/// that carries attachments.
+fn anthropic_user_content_blocks(message: &ChatMessage) -> Vec<Value> {
+    use crate::message::{AttachmentKind, AttachmentSource};
+
+    let mut blocks = Vec::new();
+    if let Some(text) = message.content.as_deref()
+        && !text.is_empty()
+    {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+
+    for attachment in &message.attachments {
+        let block_type = match attachment.kind {
+            AttachmentKind::Image => "image",
+            AttachmentKind::Document => "document",
+        };
+        let source = match &attachment.source {
+            AttachmentSource::Base64(data) => json!({
+                "type": "base64",
+                "media_type": attachment.media_type,
+                "data": data,
+            }),
+            AttachmentSource::Url(url) => json!({ "type": "url", "url": url }),
+        };
+        blocks.push(json!({ "type": block_type, "source": source }));
+    }
+
+    blocks
 }
 
 fn assistant_message_to_anthropic_json(message: &ChatMessage) -> Value {

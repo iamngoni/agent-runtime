@@ -6,18 +6,83 @@ use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 use web_time::Instant;
 
-use crate::http::{HttpRequest, SharedHttpClient, collect_stream_to_string};
-use crate::streaming::should_flush_delta;
-use crate::{
-    AgentProvider, AgentProviderKind, AssistantTurn, ChatMessage, EventSink, MessageRole,
-    RuntimeEvent, ToolCall, ToolDefinition,
+use crate::error::{ProviderError, RetryPolicy, execute_with_retry};
+use crate::http::{HttpRequest, HttpResponse, SharedHttpClient, collect_stream_to_string};
+use crate::provider::{
+    AgentProviderKind, EmbeddingProvider, ModelTiers, ProviderInfo, TextProvider,
 };
+use crate::streaming::should_flush_delta;
+use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
 
-const OPENAI_CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
-
-#[derive(Debug, Clone, Default)]
+/// Configuration for an OpenAI-compatible provider. The same client drives
+/// OpenAI, Groq, DeepSeek, xAI, Mistral, Ollama, OpenRouter and any other
+/// endpoint that speaks the `/chat/completions` wire format — they differ only
+/// by `kind`, `base_url`, headers and model tiers.
+#[derive(Debug, Clone)]
 pub struct OpenAiClientConfig {
+    pub kind: AgentProviderKind,
+    /// API base URL, e.g. `https://api.groq.com/openai/v1` (no trailing slash
+    /// required; one is trimmed). `/chat/completions` and `/embeddings` are
+    /// appended to it.
+    pub base_url: String,
+    /// Extra headers sent on every request (e.g. OpenRouter's `HTTP-Referer`).
+    pub extra_headers: Vec<(String, String)>,
+    pub model_tiers: ModelTiers,
+    pub retry: RetryPolicy,
     pub verbose: bool,
+}
+
+impl Default for OpenAiClientConfig {
+    fn default() -> Self {
+        Self::for_kind(AgentProviderKind::OpenAi)
+    }
+}
+
+impl OpenAiClientConfig {
+    /// Build a config seeded with a vendor's default base URL and model tiers.
+    /// Panics for [`AgentProviderKind::Custom`] (no default base URL); use
+    /// [`OpenAiClientConfig::new`] and supply one explicitly.
+    pub fn for_kind(kind: AgentProviderKind) -> Self {
+        let base_url = kind
+            .default_base_url()
+            .unwrap_or_else(|| {
+                panic!(
+                    "provider '{}' has no default base URL; construct OpenAiClientConfig::new with one",
+                    kind.as_str()
+                )
+            })
+            .to_string();
+        let model_tiers = kind.default_model_tiers();
+        Self {
+            kind,
+            base_url,
+            extra_headers: Vec::new(),
+            model_tiers,
+            retry: RetryPolicy::default(),
+            verbose: false,
+        }
+    }
+
+    /// Build a config with an explicit base URL — required for custom vendors.
+    pub fn new(kind: AgentProviderKind, base_url: impl Into<String>) -> Self {
+        let model_tiers = kind.default_model_tiers();
+        Self {
+            kind,
+            base_url: base_url.into(),
+            extra_headers: Vec::new(),
+            model_tiers,
+            retry: RetryPolicy::default(),
+            verbose: false,
+        }
+    }
+
+    fn chat_completions_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    fn embeddings_url(&self) -> String {
+        format!("{}/embeddings", self.base_url.trim_end_matches('/'))
+    }
 }
 
 #[derive(Clone)]
@@ -28,6 +93,7 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
+    /// A plain OpenAI client against the public API.
     pub fn new(http_client: SharedHttpClient, api_key: impl Into<String>) -> Self {
         Self::with_config(http_client, api_key, OpenAiClientConfig::default())
     }
@@ -37,13 +103,14 @@ impl OpenAiClient {
         api_key: impl Into<String>,
         verbose: bool,
     ) -> Self {
-        Self {
-            http_client,
-            api_key: api_key.into(),
-            config: OpenAiClientConfig { verbose },
-        }
+        let config = OpenAiClientConfig {
+            verbose,
+            ..OpenAiClientConfig::default()
+        };
+        Self::with_config(http_client, api_key, config)
     }
 
+    /// Build a client for any OpenAI-compatible provider.
     pub fn with_config(
         http_client: SharedHttpClient,
         api_key: impl Into<String>,
@@ -58,6 +125,43 @@ impl OpenAiClient {
 
     pub fn verbose(&self) -> bool {
         self.config.verbose
+    }
+
+    fn provider_name(&self) -> &str {
+        self.config.kind.as_str()
+    }
+
+    /// Apply auth + configured extra headers to a request.
+    fn prepare(&self, request: HttpRequest) -> HttpRequest {
+        let mut request = request.bearer_auth(&self.api_key);
+        for (name, value) in &self.config.extra_headers {
+            request = request.header(name, value);
+        }
+        request
+    }
+
+    /// Send a buffered request with retry + typed error classification.
+    async fn send_classified(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
+        let name = self.provider_name();
+        execute_with_retry(&self.config.retry, || {
+            let request = request.clone();
+            async move {
+                let response = self
+                    .http_client
+                    .send(request)
+                    .await
+                    .map_err(|err| ProviderError::transport(name, err))?;
+                if response.is_success() {
+                    Ok(response)
+                } else {
+                    let body = response
+                        .text()
+                        .unwrap_or_else(|_| "<failed to read response body>".to_string());
+                    Err(ProviderError::from_status(name, response.status, body))
+                }
+            }
+        })
+        .await
     }
 
     async fn request_assistant_turn_impl(
@@ -77,6 +181,7 @@ impl OpenAiClient {
 
         if self.verbose() {
             info!(
+                provider = self.provider_name(),
                 model = %model,
                 history_count = history.len(),
                 tool_count = tool_definitions.len(),
@@ -96,35 +201,17 @@ impl OpenAiClient {
             request_payload.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
 
-        let request = HttpRequest::post(OPENAI_CHAT_COMPLETIONS_URL)
-            .bearer_auth(&self.api_key)
+        let request = self
+            .prepare(HttpRequest::post(self.config.chat_completions_url()))
             .json_body(&Value::Object(request_payload))?;
         let response = self
-            .http_client
-            .send(request)
+            .send_classified(request)
             .await
-            .context("failed to call OpenAI assistant with tools")?;
-
-        if !response.is_success() {
-            let status = response.status;
-            let body = response
-                .text()
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
-            if self.verbose() {
-                warn!(
-                    model = %model,
-                    duration_ms = request_started_at.elapsed().as_millis() as u64,
-                    status,
-                    body = %body,
-                    "assistant turn request failed"
-                );
-            }
-            return Err(anyhow!("OpenAI assistant call returned {status}: {body}"));
-        }
+            .context("failed to call OpenAI-compatible assistant with tools")?;
 
         let body: ToolChatCompletionResponse = response
             .json()
-            .context("failed to decode OpenAI assistant tool response")?;
+            .context("failed to decode assistant tool response")?;
 
         let assistant_turn: AssistantTurn = body
             .choices
@@ -132,10 +219,11 @@ impl OpenAiClient {
             .next()
             .map(|choice| choice.message.try_into())
             .transpose()?
-            .ok_or_else(|| anyhow!("OpenAI assistant response did not contain a choice"))?;
+            .ok_or_else(|| anyhow!("assistant response did not contain a choice"))?;
 
         if self.verbose() {
             info!(
+                provider = self.provider_name(),
                 model = %model,
                 duration_ms = request_started_at.elapsed().as_millis() as u64,
                 tool_calls = assistant_turn.tool_calls.len(),
@@ -174,6 +262,7 @@ impl OpenAiClient {
 
         if self.verbose() {
             info!(
+                provider = self.provider_name(),
                 model = %model,
                 message_count = messages.len(),
                 system_prompt_chars = system_prompt.chars().count(),
@@ -187,20 +276,21 @@ impl OpenAiClient {
             "messages": all_messages,
         });
 
-        let request = HttpRequest::post(OPENAI_CHAT_COMPLETIONS_URL)
-            .bearer_auth(&self.api_key)
+        let request = self
+            .prepare(HttpRequest::post(self.config.chat_completions_url()))
             .json_body(&request_payload)?;
         let response = self
             .http_client
             .send_streaming(request)
             .await
-            .context("failed to call OpenAI chat completions for tool follow-up")?;
+            .context("failed to call chat completions for streamed message")?;
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
             let body = collect_stream_to_string(response.body).await;
             if self.verbose() {
                 warn!(
+                    provider = self.provider_name(),
                     model = %model,
                     duration_ms = request_started_at.elapsed().as_millis() as u64,
                     status,
@@ -208,7 +298,7 @@ impl OpenAiClient {
                     "streamed assistant message request failed"
                 );
             }
-            return Err(anyhow!("OpenAI tool follow-up returned {status}: {body}"));
+            return Err(ProviderError::from_status(self.provider_name(), status, body).into());
         }
 
         let mut response_stream = response.body;
@@ -221,9 +311,9 @@ impl OpenAiClient {
         let mut flush_count = 0usize;
 
         while let Some(chunk) = response_stream.next().await {
-            let chunk = chunk.context("failed to read OpenAI tool follow-up response chunk")?;
+            let chunk = chunk.context("failed to read streamed response chunk")?;
             let chunk_text = std::str::from_utf8(&chunk)
-                .context("failed to decode OpenAI tool follow-up response chunk as UTF-8")?;
+                .context("failed to decode streamed response chunk as UTF-8")?;
             chunk_count += 1;
             raw_event_buffer.push_str(&chunk_text.replace('\r', ""));
 
@@ -276,11 +366,12 @@ impl OpenAiClient {
 
         let message = full_message.trim().to_string();
         if message.is_empty() {
-            return Err(anyhow!("OpenAI tool follow-up returned an empty message"));
+            return Err(anyhow!("streamed assistant message returned an empty message"));
         }
 
         if self.verbose() {
             info!(
+                provider = self.provider_name(),
                 model = %model,
                 duration_ms = request_started_at.elapsed().as_millis() as u64,
                 chunk_count,
@@ -294,18 +385,51 @@ impl OpenAiClient {
 
         Ok(message)
     }
+
+    async fn embed_impl(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let request_payload = json!({
+            "model": model,
+            "input": inputs,
+        });
+
+        let request = self
+            .prepare(HttpRequest::post(self.config.embeddings_url()))
+            .json_body(&request_payload)?;
+        let response = self
+            .send_classified(request)
+            .await
+            .context("failed to call embeddings endpoint")?;
+
+        let body: EmbeddingResponse = response
+            .json()
+            .context("failed to decode embeddings response")?;
+
+        let mut data = body.data;
+        data.sort_by_key(|item| item.index);
+        Ok(data.into_iter().map(|item| item.embedding).collect())
+    }
 }
 
-#[async_trait]
-impl AgentProvider for OpenAiClient {
+impl ProviderInfo for OpenAiClient {
     fn kind(&self) -> AgentProviderKind {
-        AgentProviderKind::OpenAi
+        self.config.kind.clone()
     }
 
     fn verbose(&self) -> bool {
-        self.verbose()
+        self.config.verbose
     }
 
+    fn model_tiers(&self) -> &ModelTiers {
+        &self.config.model_tiers
+    }
+}
+
+#[async_trait]
+impl TextProvider for OpenAiClient {
     async fn request_assistant_turn(
         &self,
         model: &str,
@@ -326,6 +450,13 @@ impl AgentProvider for OpenAiClient {
     ) -> Result<String> {
         self.stream_message_impl(model, system_prompt, messages, sink)
             .await
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for OpenAiClient {
+    async fn embed(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_impl(model, inputs).await
     }
 }
 
@@ -387,6 +518,10 @@ fn openai_function_tools(definitions: &[ToolDefinition]) -> Vec<Value> {
 
 fn message_to_openai_json(message: &ChatMessage) -> Value {
     match message.role {
+        MessageRole::User if message.has_attachments() => json!({
+            "role": "user",
+            "content": openai_user_content_parts(message),
+        }),
         MessageRole::System | MessageRole::User => json!({
             "role": role_name(message.role),
             "content": message.content,
@@ -420,6 +555,46 @@ fn message_to_openai_json(message: &ChatMessage) -> Value {
             Value::Object(object)
         }
     }
+}
+
+/// Build OpenAI's multimodal `content` array (text + image/file parts) for a
+/// user message that carries attachments.
+fn openai_user_content_parts(message: &ChatMessage) -> Vec<Value> {
+    use crate::message::{AttachmentKind, AttachmentSource};
+
+    let mut parts = Vec::new();
+    if let Some(text) = message.content.as_deref()
+        && !text.is_empty()
+    {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+
+    for attachment in &message.attachments {
+        let part = match attachment.kind {
+            AttachmentKind::Image => {
+                let url = match &attachment.source {
+                    AttachmentSource::Url(url) => url.clone(),
+                    AttachmentSource::Base64(_) => {
+                        attachment.data_uri().unwrap_or_default()
+                    }
+                };
+                json!({ "type": "image_url", "image_url": { "url": url } })
+            }
+            AttachmentKind::Document => match &attachment.source {
+                AttachmentSource::Base64(_) => json!({
+                    "type": "file",
+                    "file": { "file_data": attachment.data_uri().unwrap_or_default() },
+                }),
+                AttachmentSource::Url(url) => json!({
+                    "type": "file",
+                    "file": { "file_url": url },
+                }),
+            },
+        };
+        parts.push(part);
+    }
+
+    parts
 }
 
 fn tool_call_to_openai_json(call: &ToolCall) -> Value {
@@ -531,12 +706,28 @@ enum OpenAiToolArgumentsWire {
     JsonValue(Value),
 }
 
+#[derive(Debug, Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingItem {
+    #[serde(default)]
+    index: usize,
+    embedding: Vec<f32>,
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{OpenAiAssistantMessage, parse_openai_stream_event, tool_call_to_openai_json};
+    use super::{
+        OpenAiAssistantMessage, OpenAiClientConfig, parse_openai_stream_event,
+        tool_call_to_openai_json,
+    };
+    use crate::provider::AgentProviderKind;
     use crate::{AssistantTurn, ParsedStreamEvent, ToolCall};
 
     #[test]
@@ -581,5 +772,30 @@ mod tests {
         assert_eq!(turn.tool_calls[0].name, "search_products");
         assert_eq!(turn.tool_calls[0].arguments, json!({ "query": "lagavulin" }));
         Ok(())
+    }
+
+    #[test]
+    fn derives_endpoints_from_base_url() {
+        let config = OpenAiClientConfig::for_kind(AgentProviderKind::Groq);
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+        assert_eq!(
+            config.embeddings_url(),
+            "https://api.groq.com/openai/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn custom_base_url_trims_trailing_slash() {
+        let config = OpenAiClientConfig::new(
+            AgentProviderKind::Custom("local".to_string()),
+            "http://localhost:8000/v1/",
+        );
+        assert_eq!(
+            config.chat_completions_url(),
+            "http://localhost:8000/v1/chat/completions"
+        );
     }
 }
