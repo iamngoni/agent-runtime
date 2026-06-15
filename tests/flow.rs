@@ -47,6 +47,15 @@ impl MockHttpClient {
     fn request_count(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
+
+    fn last_request_body(&self) -> Vec<u8> {
+        self.requests
+            .lock()
+            .unwrap()
+            .last()
+            .map(|r| r.body.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -299,6 +308,44 @@ async fn high_level_run_drives_a_declarative_agent() -> Result<()> {
     // The whole tool session is hidden behind one call:
     let reply = llm.run(&CashierAgent, "ring up a latte").await?;
     assert_eq!(reply, "Rang up: latte");
+    Ok(())
+}
+
+/// A tool-less agent (so the single buffered turn carries the attachment).
+struct VisionAgent;
+
+impl Agent for VisionAgent {
+    fn instructions(&self) -> String {
+        "Describe images briefly.".into()
+    }
+    fn model(&self) -> String {
+        "gpt-4o".into()
+    }
+}
+
+#[tokio::test]
+async fn run_message_carries_attachments_through_high_level_api() -> Result<()> {
+    use agent_runtime::Attachment;
+
+    let mock = MockHttpClient::new();
+    // No tools => one buffered decision turn that resolves directly.
+    mock.push_buffered(
+        200,
+        json!({ "choices": [{ "message": { "content": "A cat." } }] }).to_string(),
+    );
+    let llm = build_llm(mock.clone());
+
+    let message = ChatMessage::user_with_attachments(
+        "What's in this image?",
+        vec![Attachment::image_url("https://example.com/cat.png")],
+    );
+    let reply = llm.run_message(&VisionAgent, &[], message).await?;
+    assert_eq!(reply, "A cat.");
+
+    // The attachment must have reached the wire as a multimodal image part.
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(sent.contains("image_url"), "request body: {sent}");
+    assert!(sent.contains("https://example.com/cat.png"));
     Ok(())
 }
 

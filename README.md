@@ -91,9 +91,11 @@ impl Agent for Cashier {
 // let reply = llm.run(&cashier, "two lattes and an espresso, then check out").await?;
 ```
 
-`run` has siblings: `run_with_history(agent, &history, input)` for memory, and
-`run_stream(agent, &history, input, &mut sink)` to stream tokens. Need a shared,
-typed tool context instead of `()`? Drop to `llm.execute_tool_session(...)`.
+`run` has siblings: `run_with_history(agent, &history, input)` for memory,
+`run_stream(agent, &history, input, &mut sink)` to stream tokens, and
+`run_message(agent, &history, msg)` to pass a full `ChatMessage` (e.g. with
+[attachments](#attachments-images--documents)). Need a shared, typed tool
+context instead of `()`? Drop to `llm.execute_tool_session(...)`.
 
 ## Examples
 
@@ -195,6 +197,10 @@ let message = ChatMessage::user_with_attachments(
 // or by URL, or a document:
 // Attachment::image_url("https://…/chart.png")
 // Attachment::document_base64("application/pdf", base64_pdf)
+
+// Run it through the high-level API with `run_message` (the string-based
+// `run` can't carry attachments):
+let reply = llm.run_message(&agent, &[], message).await?;
 ```
 
 ## Conversation memory

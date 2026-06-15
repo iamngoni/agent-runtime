@@ -1,25 +1,22 @@
 //! Multimodal input: attach an image to a message.
 //!
-//! Attachments ride on a `ChatMessage`, so this uses the lower-level
-//! `stream_message` rather than the string-only `run`. Each provider maps the
-//! attachment to its own multimodal format.
+//! Attachments ride on a `ChatMessage`, so this uses `run_message` (the
+//! high-level runner variant that takes a full message) rather than the
+//! string-only `run`. Each provider maps the attachment to its own multimodal
+//! format.
 //!
 //! Run with: `OPENAI_API_KEY=sk-... cargo run --example 05_attachments`
 
-use agent_runtime::{
-    AgentProviderKind, Attachment, ChatMessage, EventSink, Llm, RuntimeEvent,
-};
-use async_trait::async_trait;
+use agent_runtime::{Agent, AgentProviderKind, Attachment, ChatMessage, Llm};
 
-struct PrintSink;
+struct Vision;
 
-#[async_trait]
-impl EventSink for PrintSink {
-    async fn emit(&mut self, event: RuntimeEvent) -> anyhow::Result<()> {
-        if let RuntimeEvent::AssistantDelta { delta } = event {
-            print!("{delta}");
-        }
-        Ok(())
+impl Agent for Vision {
+    fn instructions(&self) -> String {
+        "Describe images briefly.".into()
+    }
+    fn model(&self) -> String {
+        "gpt-4o".into()
     }
 }
 
@@ -39,8 +36,8 @@ async fn main() -> anyhow::Result<()> {
         // or a document:     Attachment::document_base64("application/pdf", b64)
     );
 
-    llm.stream_message("gpt-4o", "Describe images briefly.", &[message], &mut PrintSink)
-        .await?;
-    println!();
+    // Attachments flow through the high-level API via `run_message`.
+    let reply = llm.run_message(&Vision, &[], message).await?;
+    println!("{reply}");
     Ok(())
 }

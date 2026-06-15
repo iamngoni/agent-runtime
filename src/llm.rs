@@ -83,7 +83,7 @@ impl Llm {
     /// site.
     pub async fn run(&self, agent: &dyn Agent, input: impl Into<String>) -> Result<String> {
         let outcome = self
-            .run_session(agent, &[], input.into(), &mut NullEventSink)
+            .run_session(agent, &[], ChatMessage::user(input.into()), &mut NullEventSink)
             .await?;
         Ok(outcome.into_message())
     }
@@ -97,7 +97,7 @@ impl Llm {
         input: impl Into<String>,
     ) -> Result<String> {
         let outcome = self
-            .run_session(agent, history, input.into(), &mut NullEventSink)
+            .run_session(agent, history, ChatMessage::user(input.into()), &mut NullEventSink)
             .await?;
         Ok(outcome.into_message())
     }
@@ -115,14 +115,53 @@ impl Llm {
     where
         E: EventSink,
     {
-        self.run_session(agent, history, input.into(), sink).await
+        self.run_session(agent, history, ChatMessage::user(input.into()), sink)
+            .await
+    }
+
+    /// Run an agent with a fully-formed user [`ChatMessage`] as the turn —
+    /// the way to pass **attachments** (images/documents) through the
+    /// high-level API, which the string-based [`run`](Llm::run) can't carry.
+    ///
+    /// ```ignore
+    /// let msg = ChatMessage::user_with_attachments(
+    ///     "What's in this image?",
+    ///     vec![Attachment::image_url("https://…/chart.png")],
+    /// );
+    /// let reply = llm.run_message(&agent, &[], msg).await?;
+    /// ```
+    pub async fn run_message(
+        &self,
+        agent: &dyn Agent,
+        history: &[ChatMessage],
+        message: ChatMessage,
+    ) -> Result<String> {
+        let outcome = self
+            .run_session(agent, history, message, &mut NullEventSink)
+            .await?;
+        Ok(outcome.into_message())
+    }
+
+    /// [`run_message`](Llm::run_message) with token streaming; returns the full
+    /// [`ToolSessionOutcome`].
+    pub async fn run_message_stream<E>(
+        &self,
+        agent: &dyn Agent,
+        history: &[ChatMessage],
+        message: ChatMessage,
+        sink: &mut E,
+    ) -> Result<ToolSessionOutcome>
+    where
+        E: EventSink,
+    {
+        self.run_session(agent, history, message, sink).await
     }
 
     async fn run_session<E>(
         &self,
         agent: &dyn Agent,
         history: &[ChatMessage],
-        input: String,
+        user_message: ChatMessage,
         sink: &mut E,
     ) -> Result<ToolSessionOutcome>
     where
@@ -140,7 +179,7 @@ impl Llm {
         let registry = agent.tools();
 
         let mut messages = history.to_vec();
-        messages.push(ChatMessage::user(input));
+        messages.push(user_message);
 
         self.execute_tool_session(
             ToolSessionRequest {
