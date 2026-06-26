@@ -12,7 +12,10 @@ use crate::provider::{
     AgentProviderKind, EmbeddingProvider, ModelTiers, ProviderInfo, TextProvider,
 };
 use crate::streaming::should_flush_delta;
-use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
+use crate::{
+    AssistantTurn, ChatMessage, EventSink, MessageRole, ResponseFormat, RuntimeEvent, ToolCall,
+    ToolDefinition,
+};
 
 /// Configuration for an OpenAI-compatible provider. The same client drives
 /// OpenAI, Groq, DeepSeek, xAI, Mistral, Ollama, OpenRouter and any other
@@ -240,6 +243,87 @@ impl OpenAiClient {
         Ok(assistant_turn)
     }
 
+    async fn request_structured_impl(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        history: &[ChatMessage],
+        format: &ResponseFormat,
+    ) -> Result<Value> {
+        let request_started_at = Instant::now();
+        let mut messages = Vec::with_capacity(history.len() + 1);
+        messages.push(json!({
+            "role": "system",
+            "content": system_prompt,
+        }));
+        messages.extend(history.iter().map(message_to_openai_json));
+
+        if self.verbose() {
+            info!(
+                provider = self.provider_name(),
+                model = %model,
+                history_count = history.len(),
+                schema = %format.name,
+                "requesting structured output"
+            );
+        }
+
+        // Force a single synthetic function whose parameters are the requested
+        // schema; `tool_choice: function` requires the model to call it.
+        let response_tool = ToolDefinition {
+            name: format.name.clone(),
+            description: format.description.clone(),
+            input_schema: format.schema.clone(),
+        };
+
+        let mut request_payload = Map::new();
+        request_payload.insert("model".to_string(), Value::String(model.to_string()));
+        request_payload.insert("messages".to_string(), Value::Array(messages));
+        request_payload.insert(
+            "tools".to_string(),
+            Value::Array(openai_function_tools(&[response_tool])),
+        );
+        request_payload.insert(
+            "tool_choice".to_string(),
+            json!({ "type": "function", "function": { "name": format.name } }),
+        );
+
+        let request = self
+            .prepare(HttpRequest::post(self.config.chat_completions_url()))
+            .json_body(&Value::Object(request_payload))?;
+        let response = self
+            .send_classified(request)
+            .await
+            .context("failed to call OpenAI-compatible provider for structured output")?;
+
+        let body: ToolChatCompletionResponse = response
+            .json()
+            .context("failed to decode structured tool response")?;
+        let assistant_turn: AssistantTurn = body
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message.try_into())
+            .transpose()?
+            .ok_or_else(|| anyhow!("structured response did not contain a choice"))?;
+
+        if self.verbose() {
+            info!(
+                provider = self.provider_name(),
+                model = %model,
+                duration_ms = request_started_at.elapsed().as_millis() as u64,
+                "structured output completed"
+            );
+        }
+
+        assistant_turn
+            .tool_calls
+            .into_iter()
+            .next()
+            .map(|call| call.arguments)
+            .ok_or_else(|| anyhow!("structured response did not contain a tool call"))
+    }
+
     async fn stream_message_impl(
         &self,
         model: &str,
@@ -449,6 +533,17 @@ impl TextProvider for OpenAiClient {
         sink: &mut dyn EventSink,
     ) -> Result<String> {
         self.stream_message_impl(model, system_prompt, messages, sink)
+            .await
+    }
+
+    async fn request_structured(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        format: &ResponseFormat,
+    ) -> Result<Value> {
+        self.request_structured_impl(model, system_prompt, messages, format)
             .await
     }
 }

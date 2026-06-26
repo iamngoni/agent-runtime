@@ -10,7 +10,10 @@ use crate::error::{ProviderError, RetryPolicy, execute_with_retry};
 use crate::http::{HttpRequest, HttpResponse, SharedHttpClient, collect_stream_to_string};
 use crate::provider::{AgentProviderKind, ModelTiers, ProviderInfo, TextProvider};
 use crate::streaming::should_flush_delta;
-use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
+use crate::{
+    AssistantTurn, ChatMessage, EventSink, MessageRole, ResponseFormat, RuntimeEvent, ToolCall,
+    ToolDefinition,
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
@@ -184,6 +187,76 @@ impl AnthropicClient {
         }
 
         Ok(assistant_turn)
+    }
+
+    async fn request_structured_impl(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        format: &ResponseFormat,
+    ) -> Result<Value> {
+        let request_started_at = Instant::now();
+        let anthropic_messages = messages_to_anthropic_json(messages)?;
+
+        if self.verbose() {
+            info!(
+                model = %model,
+                history_count = messages.len(),
+                schema = %format.name,
+                "requesting structured output"
+            );
+        }
+
+        // Force a single synthetic tool whose input schema is the requested
+        // shape; `tool_choice: tool` makes the model emit it (no free text).
+        let response_tool = ToolDefinition {
+            name: format.name.clone(),
+            description: format.description.clone(),
+            input_schema: format.schema.clone(),
+        };
+
+        let mut request_payload = Map::new();
+        request_payload.insert("model".to_string(), Value::String(model.to_string()));
+        request_payload.insert("max_tokens".to_string(), json!(self.config.max_tokens));
+        request_payload.insert("system".to_string(), Value::String(system_prompt.to_string()));
+        request_payload.insert("messages".to_string(), Value::Array(anthropic_messages));
+        request_payload.insert(
+            "tools".to_string(),
+            Value::Array(anthropic_tools(&[response_tool])),
+        );
+        request_payload.insert(
+            "tool_choice".to_string(),
+            json!({ "type": "tool", "name": format.name }),
+        );
+
+        let request = self
+            .prepare(HttpRequest::post(self.config.messages_url()))
+            .json_body(&Value::Object(request_payload))?;
+        let response = self
+            .send_classified(request)
+            .await
+            .context("failed to call Anthropic for structured output")?;
+
+        let body: AnthropicMessageResponse = response
+            .json()
+            .context("failed to decode Anthropic structured response")?;
+        let assistant_turn = assistant_turn_from_anthropic_content(&body.content)?;
+
+        if self.verbose() {
+            info!(
+                model = %model,
+                duration_ms = request_started_at.elapsed().as_millis() as u64,
+                "structured output completed"
+            );
+        }
+
+        assistant_turn
+            .tool_calls
+            .into_iter()
+            .next()
+            .map(|call| call.arguments)
+            .ok_or_else(|| anyhow!("Anthropic structured response contained no tool_use block"))
     }
 
     async fn stream_message_impl(
@@ -362,6 +435,17 @@ impl TextProvider for AnthropicClient {
         sink: &mut dyn EventSink,
     ) -> Result<String> {
         self.stream_message_impl(model, system_prompt, messages, sink)
+            .await
+    }
+
+    async fn request_structured(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        format: &ResponseFormat,
+    ) -> Result<Value> {
+        self.request_structured_impl(model, system_prompt, messages, format)
             .await
     }
 }

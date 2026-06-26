@@ -18,14 +18,14 @@ LLM crates that hard-wire `reqwest` (let alone `rustls`) can't compile to `wasm3
 
 ```toml
 [dependencies]
-agent-runtime = { git = "https://github.com/modestnerd/agent-runtime", default-features = true }
+agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", default-features = true }
 ```
 
 For a Worker (or any other wasm target), turn the reqwest backend off and bring your own:
 
 ```toml
 [dependencies]
-agent-runtime = { git = "...", default-features = false }
+agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", default-features = false }
 ```
 
 ## Two concepts: `Llm` and `Agent`
@@ -96,6 +96,35 @@ impl Agent for Cashier {
 `run_message(agent, &history, msg)` to pass a full `ChatMessage` (e.g. with
 [attachments](#attachments-images--documents)). Need a shared, typed tool
 context instead of `()`? Drop to `llm.execute_tool_session(...)`.
+
+## Structured output
+
+When you need a *typed* answer rather than prose, `run_structured` constrains the
+model's final response to a JSON Schema (derived from your type) and returns the
+deserialized value. The agent still uses its tools to gather context first; only
+the final answer is forced to the schema — so the result always deserializes,
+with no parsing-the-prose guesswork.
+
+```rust
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Reply {
+    Text { text: String },
+    Choices { prompt: String, options: Vec<String> },
+}
+
+let reply: Reply = llm.run_structured(&agent, "which milk?").await?;
+```
+
+Enforcement is via a forced single-tool call under the hood, so it works on every
+backend that supports forced tool choice (Anthropic and all OpenAI-compatible
+providers); providers without that capability return a clear "not supported"
+error rather than silently degrading to free text. Drop to
+`provider.request_structured(model, system, &messages, &ResponseFormat)` for the
+low-level handle.
 
 ## Examples
 

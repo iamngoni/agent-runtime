@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 
 use crate::anthropic::AnthropicClientConfig;
 use crate::bedrock::BedrockClientConfig;
@@ -17,8 +19,9 @@ use crate::openai::OpenAiClientConfig;
 use crate::provider::{ModelTier, ModelTiers, TextProvider};
 use crate::{
     Agent, AgentProviderKind, AnthropicClient, AssistantTurn, BedrockClient, ChatMessage,
-    CohereClient, EventSink, GeminiClient, NullEventSink, OpenAiClient, ToolDefinition,
-    ToolSessionOutcome, ToolSessionRequest, execute_tool_session,
+    CohereClient, EventSink, GeminiClient, NullEventSink, OpenAiClient, ResponseFormat,
+    ToolDefinition, ToolSessionOutcome, ToolSessionRequest, build_followup_messages,
+    execute_tool_calls, execute_tool_session,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +103,94 @@ impl Llm {
             .run_session(agent, history, ChatMessage::user(input.into()), &mut NullEventSink)
             .await?;
         Ok(outcome.into_message())
+    }
+
+    /// Run an agent and return its answer as a **structured value** of type `T`,
+    /// constrained to `T`'s JSON Schema. The agent first uses any tools it has to
+    /// gather context (exactly as [`run`](Llm::run) would), then the final answer
+    /// is forced to conform to the schema — so `T` always deserializes, no
+    /// parsing-the-prose guesswork.
+    ///
+    /// ```ignore
+    /// #[derive(serde::Deserialize, schemars::JsonSchema)]
+    /// struct Reply { kind: String, text: String }
+    /// let reply: Reply = llm.run_structured(&agent, "two lattes").await?;
+    /// ```
+    pub async fn run_structured<T>(
+        &self,
+        agent: &dyn Agent,
+        input: impl Into<String>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned + JsonSchema,
+    {
+        self.run_structured_with_history(agent, &[], input).await
+    }
+
+    /// Like [`run_structured`](Llm::run_structured) but prepends prior
+    /// conversation `history`.
+    pub async fn run_structured_with_history<T>(
+        &self,
+        agent: &dyn Agent,
+        history: &[ChatMessage],
+        input: impl Into<String>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned + JsonSchema,
+    {
+        let instructions = agent.instructions();
+        let model = {
+            let chosen = agent.model();
+            if chosen.is_empty() {
+                self.model_for(ModelTier::Default).to_string()
+            } else {
+                chosen
+            }
+        };
+        let registry = agent.tools();
+
+        let mut messages = history.to_vec();
+        messages.push(ChatMessage::user(input.into()));
+
+        // Optional tool-gathering pass: let the agent call its tools to collect
+        // the context it needs. A forced structured answer can't also call
+        // tools in the same turn, so we gather first, then constrain the final
+        // answer below.
+        let tool_definitions = registry.definitions();
+        let final_messages = if tool_definitions.is_empty() {
+            messages
+        } else {
+            let turn = self
+                .provider
+                .request_assistant_turn(&model, &instructions, &messages, &tool_definitions)
+                .await?;
+            if turn.tool_calls.is_empty() {
+                messages
+            } else {
+                let executed = execute_tool_calls(
+                    &registry,
+                    (),
+                    &turn.tool_calls,
+                    agent.max_tool_calls(),
+                    self.verbose(),
+                    &mut NullEventSink,
+                )
+                .await?;
+                if executed.is_empty() {
+                    messages
+                } else {
+                    build_followup_messages(&messages, &turn, &executed)?
+                }
+            }
+        };
+
+        let format = ResponseFormat::for_type::<T>();
+        let value = self
+            .provider
+            .request_structured(&model, &instructions, &final_messages, &format)
+            .await?;
+        serde_json::from_value(value)
+            .context("failed to deserialize structured response into the requested type")
     }
 
     /// Like [`run`](Llm::run) but streams assistant tokens to `sink` as they

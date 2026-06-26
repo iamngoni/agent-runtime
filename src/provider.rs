@@ -2,8 +2,9 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::Value;
 
-use crate::{AssistantTurn, ChatMessage, EventSink, ToolDefinition};
+use crate::{AssistantTurn, ChatMessage, EventSink, ResponseFormat, ToolDefinition};
 
 /// Identifies which upstream API a provider speaks to.
 ///
@@ -229,6 +230,23 @@ pub trait TextProvider: ProviderInfo {
         messages: &[ChatMessage],
         sink: &mut dyn EventSink,
     ) -> Result<String>;
+
+    /// Request a response constrained to `format`'s JSON Schema, returning the
+    /// structured value. Backends that support forced/structured output
+    /// (Anthropic, OpenAI-compatible) override this; the default reports the
+    /// capability as unavailable rather than silently degrading to free text.
+    async fn request_structured(
+        &self,
+        _model: &str,
+        _system_prompt: &str,
+        _messages: &[ChatMessage],
+        _format: &ResponseFormat,
+    ) -> Result<Value> {
+        anyhow::bail!(
+            "structured output is not supported by the '{}' provider",
+            self.kind().as_str()
+        )
+    }
 }
 
 /// The embeddings capability: turn text inputs into vectors. Implemented by the

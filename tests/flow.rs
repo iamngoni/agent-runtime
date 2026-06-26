@@ -444,6 +444,141 @@ async fn parent_agent_delegates_to_sub_agent() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema, PartialEq)]
+struct Summary {
+    sentiment: String,
+    score: i64,
+}
+
+/// A tool-less agent used to exercise single-shot structured output.
+struct SummarizerAgent;
+
+impl Agent for SummarizerAgent {
+    fn instructions(&self) -> String {
+        "Summarize the sentiment of the input.".into()
+    }
+    fn model(&self) -> String {
+        "gpt-4o".into()
+    }
+}
+
+#[tokio::test]
+async fn run_structured_returns_typed_payload() -> Result<()> {
+    let mock = MockHttpClient::new();
+    // Forced-function structured response — the schema name is derived from the
+    // type (`Summary`), and the arguments are the typed payload.
+    mock.push_buffered(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_s",
+                        "type": "function",
+                        "function": {
+                            "name": "Summary",
+                            "arguments": "{\"sentiment\":\"positive\",\"score\":4}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+    let llm = build_llm(mock.clone());
+
+    let summary: Summary = llm.run_structured(&SummarizerAgent, "I love this!").await?;
+    assert_eq!(
+        summary,
+        Summary {
+            sentiment: "positive".into(),
+            score: 4
+        }
+    );
+
+    // Enforcement: the request forced the schema tool, not free text.
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(sent.contains("tool_choice"), "request body: {sent}");
+    assert!(sent.contains("\"name\":\"Summary\""), "request body: {sent}");
+    assert_eq!(mock.request_count(), 1);
+    Ok(())
+}
+
+/// An agent with a tool, to prove structured output runs tools first and only
+/// then constrains the *final* answer to the schema.
+struct StructuredCashierAgent;
+
+impl Agent for StructuredCashierAgent {
+    fn instructions(&self) -> String {
+        "Ring up items with the echo tool, then summarize.".into()
+    }
+    fn model(&self) -> String {
+        "gpt-4o".into()
+    }
+    fn tools(&self) -> ToolRegistry<()> {
+        let mut r = ToolRegistry::new();
+        r.register(JsonTool::new(
+            "echo",
+            "Echo text",
+            |_ctx: (), args: EchoArgs| async move { Ok(json!({ "echoed": args.text })) },
+        ));
+        r
+    }
+}
+
+#[tokio::test]
+async fn run_structured_runs_tools_then_constrains_final_answer() -> Result<()> {
+    let mock = MockHttpClient::new();
+    // 1) Tool-gathering decision turn: call echo.
+    mock.push_buffered(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "echo", "arguments": "{\"text\":\"latte\"}" }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+    // 2) Forced structured finalizer after the tool result.
+    mock.push_buffered(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_s",
+                        "type": "function",
+                        "function": {
+                            "name": "Summary",
+                            "arguments": "{\"sentiment\":\"served\",\"score\":1}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+    let llm = build_llm(mock.clone());
+
+    let summary: Summary = llm
+        .run_structured(&StructuredCashierAgent, "one latte")
+        .await?;
+    assert_eq!(summary.sentiment, "served");
+    // Two upstream calls: the tool-gathering decision turn + the structured
+    // finalizer (no streamed synthesis on the structured path).
+    assert_eq!(mock.request_count(), 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn surfaces_non_retryable_errors() -> Result<()> {
     let mock = MockHttpClient::new();
