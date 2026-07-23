@@ -577,6 +577,18 @@ mod tests {
 
     #[cfg(feature = "reqwest-http")]
     #[test]
+    fn builder_can_select_kimi_provider() -> Result<()> {
+        let llm = Llm::builder()
+            .provider(AgentProviderKind::Kimi)
+            .api_key("test-key")
+            .build()?;
+        assert_eq!(llm.provider_kind(), AgentProviderKind::Kimi);
+        assert_eq!(llm.model_for(ModelTier::Smartest), "moonshot-v1-128k");
+        Ok(())
+    }
+
+    #[cfg(feature = "reqwest-http")]
+    #[test]
     fn builder_selects_openai_compatible_vendor() -> Result<()> {
         let llm = Llm::builder()
             .provider(AgentProviderKind::Groq)

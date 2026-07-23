@@ -883,6 +883,19 @@ mod tests {
     }
 
     #[test]
+    fn derives_kimi_endpoints_from_base_url() {
+        let config = OpenAiClientConfig::for_kind(AgentProviderKind::Kimi);
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        assert_eq!(
+            config.embeddings_url(),
+            "https://api.moonshot.cn/v1/embeddings"
+        );
+    }
+
+    #[test]
     fn custom_base_url_trims_trailing_slash() {
         let config = OpenAiClientConfig::new(
             AgentProviderKind::Custom("local".to_string()),

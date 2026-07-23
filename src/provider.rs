@@ -29,6 +29,7 @@ pub enum AgentProviderKind {
     Mistral,
     Ollama,
     OpenRouter,
+    Kimi,
     /// Any other OpenAI-compatible endpoint, identified by a free-form name.
     /// Requires an explicit base URL on the builder.
     Custom(String),
@@ -49,6 +50,7 @@ impl AgentProviderKind {
             Self::Mistral => "mistral",
             Self::Ollama => "ollama",
             Self::OpenRouter => "openrouter",
+            Self::Kimi => "kimi",
             Self::Custom(name) => name,
         }
     }
@@ -74,6 +76,7 @@ impl AgentProviderKind {
             Self::Mistral => Some("https://api.mistral.ai/v1"),
             Self::Ollama => Some("http://localhost:11434/v1"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
+            Self::Kimi => Some("https://api.moonshot.cn/v1"),
             Self::Anthropic => Some("https://api.anthropic.com/v1"),
             Self::Gemini => Some("https://generativelanguage.googleapis.com/v1beta"),
             Self::Cohere => Some("https://api.cohere.com/v2"),
@@ -126,6 +129,7 @@ impl AgentProviderKind {
                 "openai/gpt-4o-mini",
                 "openai/gpt-4o",
             ),
+            Self::Kimi => ModelTiers::new("moonshot-v1-8k", "moonshot-v1-8k", "moonshot-v1-128k"),
             Self::Custom(_) => ModelTiers::new("", "", ""),
         }
     }
@@ -145,6 +149,7 @@ impl FromStr for AgentProviderKind {
             "mistral" => Self::Mistral,
             "ollama" => Self::Ollama,
             "openrouter" => Self::OpenRouter,
+            "kimi" | "moonshot" => Self::Kimi,
             other => Self::Custom(other.to_string()),
         })
     }
