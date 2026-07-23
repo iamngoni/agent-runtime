@@ -86,7 +86,12 @@ impl Llm {
     /// site.
     pub async fn run(&self, agent: &dyn Agent, input: impl Into<String>) -> Result<String> {
         let outcome = self
-            .run_session(agent, &[], ChatMessage::user(input.into()), &mut NullEventSink)
+            .run_session(
+                agent,
+                &[],
+                ChatMessage::user(input.into()),
+                &mut NullEventSink,
+            )
             .await?;
         Ok(outcome.into_message())
     }
@@ -100,7 +105,12 @@ impl Llm {
         input: impl Into<String>,
     ) -> Result<String> {
         let outcome = self
-            .run_session(agent, history, ChatMessage::user(input.into()), &mut NullEventSink)
+            .run_session(
+                agent,
+                history,
+                ChatMessage::user(input.into()),
+                &mut NullEventSink,
+            )
             .await?;
         Ok(outcome.into_message())
     }
@@ -116,11 +126,7 @@ impl Llm {
     /// struct Reply { kind: String, text: String }
     /// let reply: Reply = llm.run_structured(&agent, "two lattes").await?;
     /// ```
-    pub async fn run_structured<T>(
-        &self,
-        agent: &dyn Agent,
-        input: impl Into<String>,
-    ) -> Result<T>
+    pub async fn run_structured<T>(&self, agent: &dyn Agent, input: impl Into<String>) -> Result<T>
     where
         T: DeserializeOwned + JsonSchema,
     {
@@ -522,6 +528,7 @@ impl LlmBuilder {
                     model_tiers,
                     retry: self.retry,
                     verbose: self.config.verbose,
+                    max_completion_tokens: None,
                 };
                 Arc::new(OpenAiClient::with_config(http_client, api_key, config))
             }

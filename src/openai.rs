@@ -33,6 +33,15 @@ pub struct OpenAiClientConfig {
     pub model_tiers: ModelTiers,
     pub retry: RetryPolicy,
     pub verbose: bool,
+    /// Sent as `max_completion_tokens` on every request when set. Reasoning
+    /// ("thinking") models such as Kimi's share one token budget between
+    /// `reasoning_content` and the final `content` - the Kimi Code CLI's own
+    /// docs warn a too-small budget "can cause a 200 response with no
+    /// `content`" and its agent loop always sets an explicit cap (32,000 as
+    /// the fallback for models, like `kimi-for-coding`, with no known
+    /// context-window entry) specifically to stop reasoning from starving
+    /// out the answer. `None` sends no cap (provider/model default).
+    pub max_completion_tokens: Option<u64>,
 }
 
 impl Default for OpenAiClientConfig {
@@ -63,6 +72,7 @@ impl OpenAiClientConfig {
             model_tiers,
             retry: RetryPolicy::default(),
             verbose: false,
+            max_completion_tokens: None,
         }
     }
 
@@ -76,6 +86,7 @@ impl OpenAiClientConfig {
             model_tiers,
             retry: RetryPolicy::default(),
             verbose: false,
+            max_completion_tokens: None,
         }
     }
 
@@ -143,6 +154,14 @@ impl OpenAiClient {
         request
     }
 
+    /// Insert `max_completion_tokens` into a request body when configured.
+    /// See [`OpenAiClientConfig::max_completion_tokens`].
+    fn apply_max_completion_tokens(&self, payload: &mut Map<String, Value>) {
+        if let Some(cap) = self.config.max_completion_tokens {
+            payload.insert("max_completion_tokens".to_string(), json!(cap));
+        }
+    }
+
     /// Send a buffered request with retry + typed error classification.
     async fn send_classified(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
         let name = self.provider_name();
@@ -203,6 +222,7 @@ impl OpenAiClient {
             );
             request_payload.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
+        self.apply_max_completion_tokens(&mut request_payload);
 
         let request = self
             .prepare(HttpRequest::post(self.config.chat_completions_url()))
@@ -283,6 +303,7 @@ impl OpenAiClient {
             "tools".to_string(),
             Value::Array(openai_function_tools(&[response_tool])),
         );
+        self.apply_max_completion_tokens(&mut request_payload);
         request_payload.insert(
             "tool_choice".to_string(),
             json!({ "type": "function", "function": { "name": format.name } }),
@@ -354,15 +375,15 @@ impl OpenAiClient {
             );
         }
 
-        let request_payload = json!({
-            "model": model,
-            "stream": true,
-            "messages": all_messages,
-        });
+        let mut request_payload = Map::new();
+        request_payload.insert("model".to_string(), Value::String(model.to_string()));
+        request_payload.insert("stream".to_string(), Value::Bool(true));
+        request_payload.insert("messages".to_string(), Value::Array(all_messages));
+        self.apply_max_completion_tokens(&mut request_payload);
 
         let request = self
             .prepare(HttpRequest::post(self.config.chat_completions_url()))
-            .json_body(&request_payload)?;
+            .json_body(&Value::Object(request_payload))?;
         let response = self
             .http_client
             .send_streaming(request)
@@ -389,6 +410,7 @@ impl OpenAiClient {
         let mut raw_event_buffer = String::new();
         let mut full_message = String::new();
         let mut pending_delta = String::new();
+        let mut reasoning_chars = 0usize;
         let mut saw_done = false;
         let mut chunk_count = 0usize;
         let mut parsed_event_count = 0usize;
@@ -412,6 +434,11 @@ impl OpenAiClient {
                         break;
                     }
                     Ok(ParsedStreamEvent::Empty) => {}
+                    Ok(ParsedStreamEvent::ReasoningDeltas(deltas)) => {
+                        for delta in deltas {
+                            reasoning_chars += delta.chars().count();
+                        }
+                    }
                     Ok(ParsedStreamEvent::Deltas(deltas)) => {
                         for delta in deltas {
                             full_message.push_str(&delta);
@@ -450,7 +477,20 @@ impl OpenAiClient {
 
         let message = full_message.trim().to_string();
         if message.is_empty() {
-            return Err(anyhow!("streamed assistant message returned an empty message"));
+            if reasoning_chars > 0 {
+                // A reasoning ("thinking") model spent its entire response
+                // budget on chain-of-thought (DeepSeek/Kimi-style
+                // `reasoning_content`) and never emitted a final answer.
+                // Distinguish this from a truly empty/broken response so
+                // callers can tell "the model didn't converge in time" apart
+                // from "something is wrong with the connection or provider".
+                return Err(anyhow!(
+                    "streamed assistant message spent its entire response on internal reasoning ({reasoning_chars} chars) without producing a final answer"
+                ));
+            }
+            return Err(anyhow!(
+                "streamed assistant message returned an empty message"
+            ));
         }
 
         if self.verbose() {
@@ -463,6 +503,7 @@ impl OpenAiClient {
                 flush_count,
                 saw_done,
                 message_chars = message.chars().count(),
+                reasoning_chars,
                 "streamed assistant message completed"
             );
         }
@@ -558,6 +599,13 @@ impl EmbeddingProvider for OpenAiClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedStreamEvent {
     Deltas(Vec<String>),
+    /// Reasoning ("thinking") model chain-of-thought chunks - DeepSeek/Kimi-
+    /// style APIs stream these via a separate `delta.reasoning_content`
+    /// field, distinct from the final-answer `delta.content`. Callers that
+    /// don't care about reasoning can treat this like [`Self::Empty`]; it
+    /// exists so a caller CAN tell "the model is still thinking" apart from
+    /// "nothing happened at all" when the final answer never arrives.
+    ReasoningDeltas(Vec<String>),
     Done,
     Empty,
 }
@@ -581,17 +629,27 @@ pub fn parse_openai_stream_event(raw_event: &str) -> Result<ParsedStreamEvent> {
     let chunk: ChatCompletionStreamChunk = serde_json::from_str(&data)
         .with_context(|| format!("failed to decode OpenAI stream payload: {data}"))?;
 
-    let deltas = chunk
-        .choices
-        .into_iter()
-        .filter_map(|choice| choice.delta.content)
-        .filter(|delta| !delta.is_empty())
-        .collect::<Vec<_>>();
+    let mut content_deltas = Vec::new();
+    let mut reasoning_deltas = Vec::new();
+    for choice in chunk.choices {
+        if let Some(content) = choice.delta.content
+            && !content.is_empty()
+        {
+            content_deltas.push(content);
+        }
+        if let Some(reasoning) = choice.delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            reasoning_deltas.push(reasoning);
+        }
+    }
 
-    if deltas.is_empty() {
-        Ok(ParsedStreamEvent::Empty)
+    if !content_deltas.is_empty() {
+        Ok(ParsedStreamEvent::Deltas(content_deltas))
+    } else if !reasoning_deltas.is_empty() {
+        Ok(ParsedStreamEvent::ReasoningDeltas(reasoning_deltas))
     } else {
-        Ok(ParsedStreamEvent::Deltas(deltas))
+        Ok(ParsedStreamEvent::Empty)
     }
 }
 
@@ -669,9 +727,7 @@ fn openai_user_content_parts(message: &ChatMessage) -> Vec<Value> {
             AttachmentKind::Image => {
                 let url = match &attachment.source {
                     AttachmentSource::Url(url) => url.clone(),
-                    AttachmentSource::Base64(_) => {
-                        attachment.data_uri().unwrap_or_default()
-                    }
+                    AttachmentSource::Base64(_) => attachment.data_uri().unwrap_or_default(),
                 };
                 json!({ "type": "image_url", "image_url": { "url": url } })
             }
@@ -763,6 +819,10 @@ struct ChatCompletionStreamChoice {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionDelta {
     content: Option<String>,
+    /// Reasoning-model ("thinking") chain-of-thought chunks, sent by
+    /// DeepSeek/Kimi-style APIs as a field separate from `content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -816,18 +876,71 @@ struct EmbeddingItem {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     use super::{
-        OpenAiAssistantMessage, OpenAiClientConfig, parse_openai_stream_event,
+        OpenAiAssistantMessage, OpenAiClient, OpenAiClientConfig, parse_openai_stream_event,
         tool_call_to_openai_json,
     };
+    use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse};
     use crate::provider::AgentProviderKind;
     use crate::{AssistantTurn, ParsedStreamEvent, ToolCall};
 
+    struct NoopHttpClient;
+
+    #[async_trait::async_trait]
+    impl HttpClient for NoopHttpClient {
+        async fn send(&self, _request: HttpRequest) -> anyhow::Result<HttpResponse> {
+            unreachable!("not exercised by this test")
+        }
+
+        async fn send_streaming(
+            &self,
+            _request: HttpRequest,
+        ) -> anyhow::Result<HttpStreamResponse> {
+            unreachable!("not exercised by this test")
+        }
+    }
+
     #[test]
     fn parses_stream_done_event() -> Result<()> {
-        assert_eq!(parse_openai_stream_event("data: [DONE]")?, ParsedStreamEvent::Done);
+        assert_eq!(
+            parse_openai_stream_event("data: [DONE]")?,
+            ParsedStreamEvent::Done
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_content_delta_event() -> Result<()> {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+        assert_eq!(
+            parse_openai_stream_event(raw)?,
+            ParsedStreamEvent::Deltas(vec!["hi".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_reasoning_delta_event_separately_from_content() -> Result<()> {
+        // DeepSeek/Kimi-style reasoning models stream `reasoning_content`
+        // chunks distinct from `content` - reasoning-only chunks must not be
+        // mistaken for a real answer.
+        let raw = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}]}";
+        assert_eq!(
+            parse_openai_stream_event(raw)?,
+            ParsedStreamEvent::ReasoningDeltas(vec!["thinking...".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_content_delta_when_both_present_in_one_chunk() -> Result<()> {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\",\"reasoning_content\":\"thinking\"}}]}";
+        assert_eq!(
+            parse_openai_stream_event(raw)?,
+            ParsedStreamEvent::Deltas(vec!["hi".to_string()])
+        );
         Ok(())
     }
 
@@ -865,7 +978,10 @@ mod tests {
         assert_eq!(turn.content.as_deref(), Some("Let me look that up."));
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "search_products");
-        assert_eq!(turn.tool_calls[0].arguments, json!({ "query": "lagavulin" }));
+        assert_eq!(
+            turn.tool_calls[0].arguments,
+            json!({ "query": "lagavulin" })
+        );
         Ok(())
     }
 
@@ -893,6 +1009,24 @@ mod tests {
             config.embeddings_url(),
             "https://api.moonshot.cn/v1/embeddings"
         );
+    }
+
+    #[test]
+    fn applies_configured_max_completion_tokens_to_request_body() {
+        let mut with_cap = OpenAiClientConfig::for_kind(AgentProviderKind::Kimi);
+        with_cap.max_completion_tokens = Some(32_000);
+        let client =
+            OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", with_cap);
+        let mut payload = Map::new();
+        client.apply_max_completion_tokens(&mut payload);
+        assert_eq!(payload.get("max_completion_tokens"), Some(&json!(32_000)));
+
+        let without_cap = OpenAiClientConfig::for_kind(AgentProviderKind::OpenAi);
+        let client =
+            OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", without_cap);
+        let mut payload = Map::new();
+        client.apply_max_completion_tokens(&mut payload);
+        assert!(!payload.contains_key("max_completion_tokens"));
     }
 
     #[test]
