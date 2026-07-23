@@ -529,6 +529,7 @@ impl LlmBuilder {
                     retry: self.retry,
                     verbose: self.config.verbose,
                     max_completion_tokens: None,
+                    reasoning_effort: None,
                 };
                 Arc::new(OpenAiClient::with_config(http_client, api_key, config))
             }

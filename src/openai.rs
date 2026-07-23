@@ -42,6 +42,11 @@ pub struct OpenAiClientConfig {
     /// context-window entry) specifically to stop reasoning from starving
     /// out the answer. `None` sends no cap (provider/model default).
     pub max_completion_tokens: Option<u64>,
+    /// Reasoning ("thinking") effort/level for models that support it, e.g.
+    /// Kimi's `k3` (`"low"`/`"high"`/`"max"`). Wire shape depends on `kind` -
+    /// see [`OpenAiClient::apply_reasoning_effort`]. `None` sends nothing
+    /// (provider/model default).
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for OpenAiClientConfig {
@@ -73,6 +78,7 @@ impl OpenAiClientConfig {
             retry: RetryPolicy::default(),
             verbose: false,
             max_completion_tokens: None,
+            reasoning_effort: None,
         }
     }
 
@@ -87,6 +93,7 @@ impl OpenAiClientConfig {
             retry: RetryPolicy::default(),
             verbose: false,
             max_completion_tokens: None,
+            reasoning_effort: None,
         }
     }
 
@@ -162,6 +169,29 @@ impl OpenAiClient {
         }
     }
 
+    /// Insert the configured reasoning effort into a request body, in
+    /// whatever wire shape `kind` expects. See
+    /// [`OpenAiClientConfig::reasoning_effort`].
+    fn apply_reasoning_effort(&self, payload: &mut Map<String, Value>) {
+        let Some(effort) = self.config.reasoning_effort.as_deref() else {
+            return;
+        };
+        match &self.config.kind {
+            // Moonshot's Kimi Code endpoint controls reasoning depth via a
+            // proprietary `extra_body.thinking` block, not a top-level field.
+            AgentProviderKind::Custom(name) if name == "kimi_code" => {
+                payload.insert(
+                    "thinking".to_string(),
+                    json!({ "type": "enabled", "effort": effort }),
+                );
+            }
+            // Standard o-series convention, for whenever a kind adopts it.
+            _ => {
+                payload.insert("reasoning_effort".to_string(), json!(effort));
+            }
+        }
+    }
+
     /// Send a buffered request with retry + typed error classification.
     async fn send_classified(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
         let name = self.provider_name();
@@ -223,6 +253,7 @@ impl OpenAiClient {
             request_payload.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
         self.apply_max_completion_tokens(&mut request_payload);
+        self.apply_reasoning_effort(&mut request_payload);
 
         let request = self
             .prepare(HttpRequest::post(self.config.chat_completions_url()))
@@ -304,6 +335,7 @@ impl OpenAiClient {
             Value::Array(openai_function_tools(&[response_tool])),
         );
         self.apply_max_completion_tokens(&mut request_payload);
+        self.apply_reasoning_effort(&mut request_payload);
         request_payload.insert(
             "tool_choice".to_string(),
             json!({ "type": "function", "function": { "name": format.name } }),
@@ -380,6 +412,7 @@ impl OpenAiClient {
         request_payload.insert("stream".to_string(), Value::Bool(true));
         request_payload.insert("messages".to_string(), Value::Array(all_messages));
         self.apply_max_completion_tokens(&mut request_payload);
+        self.apply_reasoning_effort(&mut request_payload);
 
         let request = self
             .prepare(HttpRequest::post(self.config.chat_completions_url()))
@@ -1027,6 +1060,46 @@ mod tests {
         let mut payload = Map::new();
         client.apply_max_completion_tokens(&mut payload);
         assert!(!payload.contains_key("max_completion_tokens"));
+    }
+
+    #[test]
+    fn applies_kimi_code_reasoning_effort_as_thinking_block() {
+        let mut config = OpenAiClientConfig::new(
+            AgentProviderKind::Custom("kimi_code".to_string()),
+            "https://api.kimi.com/coding/v1",
+        );
+        config.reasoning_effort = Some("max".to_string());
+        let client = OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", config);
+        let mut payload = Map::new();
+        client.apply_reasoning_effort(&mut payload);
+        assert_eq!(
+            payload.get("thinking"),
+            Some(&json!({ "type": "enabled", "effort": "max" }))
+        );
+        assert!(!payload.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn applies_other_kinds_reasoning_effort_as_standard_field() {
+        let mut config = OpenAiClientConfig::for_kind(AgentProviderKind::OpenAi);
+        config.reasoning_effort = Some("high".to_string());
+        let client = OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", config);
+        let mut payload = Map::new();
+        client.apply_reasoning_effort(&mut payload);
+        assert_eq!(payload.get("reasoning_effort"), Some(&json!("high")));
+        assert!(!payload.contains_key("thinking"));
+    }
+
+    #[test]
+    fn skips_reasoning_effort_when_not_configured() {
+        let config = OpenAiClientConfig::new(
+            AgentProviderKind::Custom("kimi_code".to_string()),
+            "https://api.kimi.com/coding/v1",
+        );
+        let client = OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", config);
+        let mut payload = Map::new();
+        client.apply_reasoning_effort(&mut payload);
+        assert!(payload.is_empty());
     }
 
     #[test]
