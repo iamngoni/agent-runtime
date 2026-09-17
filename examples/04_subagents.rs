@@ -49,7 +49,10 @@ async fn main() -> anyhow::Result<()> {
 
     let support = SupportAgent { llm: llm.clone() };
     let reply = llm
-        .run(&support, "I'd like a refund for order #42, it arrived damaged.")
+        .run(
+            &support,
+            "I'd like a refund for order #42, it arrived damaged.",
+        )
         .await?;
     println!("{reply}");
     Ok(())

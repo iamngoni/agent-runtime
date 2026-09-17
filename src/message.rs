@@ -81,7 +81,9 @@ impl Attachment {
     /// providers (e.g. OpenAI) that take inline media as a data URL.
     pub fn data_uri(&self) -> Option<String> {
         match &self.source {
-            AttachmentSource::Base64(data) => Some(format!("data:{};base64,{}", self.media_type, data)),
+            AttachmentSource::Base64(data) => {
+                Some(format!("data:{};base64,{}", self.media_type, data))
+            }
             AttachmentSource::Url(_) => None,
         }
     }
@@ -124,10 +126,7 @@ impl ChatMessage {
 
     /// A user message carrying one or more attachments (images/documents)
     /// alongside its text.
-    pub fn user_with_attachments(
-        content: impl Into<String>,
-        attachments: Vec<Attachment>,
-    ) -> Self {
+    pub fn user_with_attachments(content: impl Into<String>, attachments: Vec<Attachment>) -> Self {
         Self {
             role: MessageRole::User,
             content: Some(content.into()),

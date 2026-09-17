@@ -24,7 +24,9 @@ use crate::error::{ProviderError, RetryPolicy, execute_with_retry};
 use crate::http::{HttpRequest, HttpResponse, SharedHttpClient, collect_stream_to_string};
 use crate::provider::{AgentProviderKind, ModelTiers, ProviderInfo, TextProvider};
 use crate::streaming::should_flush_delta;
-use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
+use crate::{
+    AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition,
+};
 
 const DEFAULT_GEMINI_MAX_TOKENS: u32 = 4096;
 
@@ -482,11 +484,12 @@ fn messages_to_gemini_contents(messages: &[ChatMessage]) -> Result<Vec<Value>> {
                         .get(&tool_call_id)
                         .cloned()
                         .unwrap_or_else(|| tool_call_id.clone());
-                    let response_value: Value =
-                        serde_json::from_str(&tool_message.content.clone().unwrap_or_default())
-                            .unwrap_or_else(|_| {
-                                json!({ "result": tool_message.content.clone().unwrap_or_default() })
-                            });
+                    let response_value: Value = serde_json::from_str(
+                        &tool_message.content.clone().unwrap_or_default(),
+                    )
+                    .unwrap_or_else(
+                        |_| json!({ "result": tool_message.content.clone().unwrap_or_default() }),
+                    );
                     parts.push(json!({
                         "functionResponse": {
                             "name": name,
@@ -547,7 +550,10 @@ fn assistant_turn_from_gemini(response: &GenerateContentResponse) -> Result<Assi
                 tool_calls.push(ToolCall {
                     id: synth_tool_call_id(&call.name, part_index),
                     name: call.name.clone(),
-                    arguments: call.args.clone().unwrap_or_else(|| Value::Object(Map::new())),
+                    arguments: call
+                        .args
+                        .clone()
+                        .unwrap_or_else(|| Value::Object(Map::new())),
                 });
             }
         }
@@ -635,7 +641,10 @@ mod tests {
     fn parses_streamed_text_part() -> Result<()> {
         let raw_event =
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n";
-        assert_eq!(parse_gemini_stream_event(raw_event)?, vec!["Hello".to_string()]);
+        assert_eq!(
+            parse_gemini_stream_event(raw_event)?,
+            vec!["Hello".to_string()]
+        );
         Ok(())
     }
 }

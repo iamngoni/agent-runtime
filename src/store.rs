@@ -37,8 +37,11 @@ pub trait ConversationStore: Send + Sync {
 
     /// The latest `limit` messages for a conversation, oldest-first, ready to
     /// pass straight back as `history`.
-    async fn latest_messages(&self, conversation_id: &str, limit: usize)
-    -> Result<Vec<ChatMessage>>;
+    async fn latest_messages(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>>;
 }
 
 #[derive(Default)]
@@ -95,7 +98,9 @@ impl ConversationStore for InMemoryConversationStore {
 
     async fn append_message(&self, conversation_id: &str, message: &ChatMessage) -> Result<()> {
         let mut conversations = self.conversations.lock().expect("store mutex poisoned");
-        let conversation = conversations.entry(conversation_id.to_string()).or_default();
+        let conversation = conversations
+            .entry(conversation_id.to_string())
+            .or_default();
         conversation.messages.push(message.clone());
         Ok(())
     }
@@ -123,9 +128,7 @@ mod tests {
         let store = InMemoryConversationStore::new();
         let id = store.create_conversation(Some("user-1"), "support").await?;
 
-        store
-            .append_message(&id, &ChatMessage::user("hi"))
-            .await?;
+        store.append_message(&id, &ChatMessage::user("hi")).await?;
         store
             .append_message(&id, &ChatMessage::assistant("hello"))
             .await?;
@@ -160,10 +163,7 @@ mod tests {
         let second = store.create_conversation(Some("user-1"), "b").await?;
         store.create_conversation(Some("user-2"), "c").await?;
 
-        assert_eq!(
-            store.latest_conversation_id("user-1").await?,
-            Some(second)
-        );
+        assert_eq!(store.latest_conversation_id("user-1").await?, Some(second));
         assert_eq!(store.latest_conversation_id("user-3").await?, None);
         Ok(())
     }

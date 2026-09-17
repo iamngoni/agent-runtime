@@ -22,7 +22,9 @@ async fn main() -> anyhow::Result<()> {
 
     // The whole tool session is hidden behind `run`. With no model set on the
     // agent, the LLM's default tier is used.
-    let reply = llm.run(&Helpful, "What is the capital of Zimbabwe?").await?;
+    let reply = llm
+        .run(&Helpful, "What is the capital of Zimbabwe?")
+        .await?;
     println!("{reply}");
     Ok(())
 }

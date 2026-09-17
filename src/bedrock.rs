@@ -23,7 +23,9 @@ use crate::error::{ProviderError, RetryPolicy, execute_with_retry};
 use crate::http::{HttpRequest, HttpResponse, SharedHttpClient};
 use crate::message::{AttachmentKind, AttachmentSource};
 use crate::provider::{AgentProviderKind, ModelTiers, ProviderInfo, TextProvider};
-use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
+use crate::{
+    AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition,
+};
 
 const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 const DEFAULT_BEDROCK_MAX_TOKENS: u32 = 4096;
@@ -55,13 +57,17 @@ impl Default for BedrockClientConfig {
 
 impl BedrockClientConfig {
     fn base_url(&self) -> String {
-        self.base_url.clone().unwrap_or_else(|| {
-            format!("https://bedrock-runtime.{}.amazonaws.com", self.region)
-        })
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| format!("https://bedrock-runtime.{}.amazonaws.com", self.region))
     }
 
     fn converse_url(&self, model: &str) -> String {
-        format!("{}/model/{}/converse", self.base_url().trim_end_matches('/'), model)
+        format!(
+            "{}/model/{}/converse",
+            self.base_url().trim_end_matches('/'),
+            model
+        )
     }
 }
 
@@ -181,8 +187,9 @@ impl BedrockClient {
             .await
             .context("failed to call Bedrock Converse")?;
 
-        let body: ConverseResponse =
-            response.json().context("failed to decode Bedrock response")?;
+        let body: ConverseResponse = response
+            .json()
+            .context("failed to decode Bedrock response")?;
         let assistant_turn = assistant_turn_from_bedrock(body.output.message)?;
 
         if self.verbose() {
@@ -389,7 +396,10 @@ fn assistant_turn_from_bedrock(message: ConverseMessage) -> Result<AssistantTurn
     }
 
     let content = (!text.trim().is_empty()).then_some(text);
-    Ok(AssistantTurn { content, tool_calls })
+    Ok(AssistantTurn {
+        content,
+        tool_calls,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,9 +440,7 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{
-        BedrockClientConfig, assistant_turn_from_bedrock, messages_to_bedrock,
-    };
+    use super::{BedrockClientConfig, assistant_turn_from_bedrock, messages_to_bedrock};
     use crate::{ChatMessage, ToolCall};
 
     #[test]
@@ -460,7 +468,10 @@ mod tests {
         let converted = messages_to_bedrock(&messages)?;
         assert_eq!(converted.len(), 2);
         assert_eq!(converted[0]["role"], json!("assistant"));
-        assert_eq!(converted[0]["content"][1]["toolUse"]["name"], json!("lookup"));
+        assert_eq!(
+            converted[0]["content"][1]["toolUse"]["name"],
+            json!("lookup")
+        );
         assert_eq!(converted[1]["role"], json!("user"));
         assert_eq!(
             converted[1]["content"][0]["toolResult"]["toolUseId"],

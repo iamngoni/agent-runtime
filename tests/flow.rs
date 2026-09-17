@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use agent_runtime::ResponseFormat;
 use agent_runtime::{
     Agent, AgentProviderKind, AgentTool, ChatMessage, EventSink, HttpByteStream, HttpClient,
     HttpRequest, HttpResponse, HttpStreamResponse, JsonTool, Llm, RetryPolicy, RuntimeEvent,
@@ -35,12 +36,18 @@ impl MockHttpClient {
     }
 
     fn push_buffered(&self, status: u16, body: impl Into<String>) -> &Self {
-        self.buffered.lock().unwrap().push_back((status, body.into()));
+        self.buffered
+            .lock()
+            .unwrap()
+            .push_back((status, body.into()));
         self
     }
 
     fn push_stream(&self, status: u16, body: impl Into<String>) -> &Self {
-        self.streamed.lock().unwrap().push_back((status, body.into()));
+        self.streamed
+            .lock()
+            .unwrap()
+            .push_back((status, body.into()));
         self
     }
 
@@ -463,6 +470,56 @@ impl Agent for SummarizerAgent {
 }
 
 #[tokio::test]
+async fn run_structured_with_format_sends_caller_schema() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_buffered(
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_f",
+                        "type": "function",
+                        "function": {
+                            "name": "trade_intent",
+                            "arguments": "{\"side\":\"buy\",\"lots\":0.1}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+    let llm = build_llm(mock.clone());
+
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "side": {"type": "string", "enum": ["buy", "sell"]},
+            "lots": {"type": "number"}
+        },
+        "required": ["side", "lots"]
+    });
+    let format = ResponseFormat::new("trade_intent", schema);
+
+    let value = llm
+        .run_structured_with_format(&SummarizerAgent, "propose a trade", format)
+        .await?;
+    assert_eq!(value["side"], "buy");
+    assert_eq!(value["lots"], 0.1);
+
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(sent.contains("trade_intent"), "request body: {sent}");
+    assert!(
+        sent.contains("\"enum\":[\"buy\",\"sell\"]"),
+        "request body: {sent}"
+    );
+    assert_eq!(mock.request_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_structured_returns_typed_payload() -> Result<()> {
     let mock = MockHttpClient::new();
     // Forced-function structured response — the schema name is derived from the
@@ -500,7 +557,10 @@ async fn run_structured_returns_typed_payload() -> Result<()> {
     // Enforcement: the request forced the schema tool, not free text.
     let sent = String::from_utf8(mock.last_request_body()).unwrap();
     assert!(sent.contains("tool_choice"), "request body: {sent}");
-    assert!(sent.contains("\"name\":\"Summary\""), "request body: {sent}");
+    assert!(
+        sent.contains("\"name\":\"Summary\""),
+        "request body: {sent}"
+    );
     assert_eq!(mock.request_count(), 1);
     Ok(())
 }

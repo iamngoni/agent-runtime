@@ -36,7 +36,9 @@ async fn main() -> anyhow::Result<()> {
     ) -> anyhow::Result<String> {
         let history = store.latest_messages(convo, 100).await?;
         let reply = llm.run_with_history(&Assistant, &history, input).await?;
-        store.append_message(convo, &ChatMessage::user(input)).await?;
+        store
+            .append_message(convo, &ChatMessage::user(input))
+            .await?;
         store
             .append_message(convo, &ChatMessage::assistant(&reply))
             .await?;

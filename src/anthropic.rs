@@ -147,7 +147,10 @@ impl AnthropicClient {
         let mut request_payload = Map::new();
         request_payload.insert("model".to_string(), Value::String(model.to_string()));
         request_payload.insert("max_tokens".to_string(), json!(self.config.max_tokens));
-        request_payload.insert("system".to_string(), Value::String(system_prompt.to_string()));
+        request_payload.insert(
+            "system".to_string(),
+            Value::String(system_prompt.to_string()),
+        );
         request_payload.insert("messages".to_string(), Value::Array(messages));
         if !tool_definitions.is_empty() {
             request_payload.insert(
@@ -219,7 +222,10 @@ impl AnthropicClient {
         let mut request_payload = Map::new();
         request_payload.insert("model".to_string(), Value::String(model.to_string()));
         request_payload.insert("max_tokens".to_string(), json!(self.config.max_tokens));
-        request_payload.insert("system".to_string(), Value::String(system_prompt.to_string()));
+        request_payload.insert(
+            "system".to_string(),
+            Value::String(system_prompt.to_string()),
+        );
         request_payload.insert("messages".to_string(), Value::Array(anthropic_messages));
         request_payload.insert(
             "tools".to_string(),
@@ -380,7 +386,9 @@ impl AnthropicClient {
 
         let message = full_message.trim().to_string();
         if message.is_empty() {
-            return Err(anyhow!("Anthropic streamed message returned an empty message"));
+            return Err(anyhow!(
+                "Anthropic streamed message returned an empty message"
+            ));
         }
 
         if self.verbose() {
@@ -633,7 +641,9 @@ fn assistant_message_to_anthropic_json(message: &ChatMessage) -> Value {
     })
 }
 
-fn assistant_turn_from_anthropic_content(content: &[AnthropicContentBlock]) -> Result<AssistantTurn> {
+fn assistant_turn_from_anthropic_content(
+    content: &[AnthropicContentBlock],
+) -> Result<AssistantTurn> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
 
@@ -656,7 +666,10 @@ fn assistant_turn_from_anthropic_content(content: &[AnthropicContentBlock]) -> R
                 tool_calls.push(ToolCall {
                     id,
                     name,
-                    arguments: block.input.clone().unwrap_or_else(|| Value::Object(Map::new())),
+                    arguments: block
+                        .input
+                        .clone()
+                        .unwrap_or_else(|| Value::Object(Map::new())),
                 });
             }
             _ => {}
@@ -723,7 +736,9 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{AnthropicParsedStreamEvent, messages_to_anthropic_json, parse_anthropic_stream_event};
+    use super::{
+        AnthropicParsedStreamEvent, messages_to_anthropic_json, parse_anthropic_stream_event,
+    };
     use crate::{ChatMessage, ToolCall};
 
     #[test]

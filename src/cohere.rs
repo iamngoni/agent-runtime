@@ -20,7 +20,9 @@ use crate::http::{HttpRequest, HttpResponse, SharedHttpClient, collect_stream_to
 use crate::message::{AttachmentKind, AttachmentSource};
 use crate::provider::{AgentProviderKind, ModelTiers, ProviderInfo, TextProvider};
 use crate::streaming::should_flush_delta;
-use crate::{AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition};
+use crate::{
+    AssistantTurn, ChatMessage, EventSink, MessageRole, RuntimeEvent, ToolCall, ToolDefinition,
+};
 
 const DEFAULT_COHERE_BASE_URL: &str = "https://api.cohere.com/v2";
 
@@ -180,8 +182,9 @@ impl CohereClient {
             .await
             .context("failed to call Cohere chat")?;
 
-        let body: CohereChatResponse =
-            response.json().context("failed to decode Cohere response")?;
+        let body: CohereChatResponse = response
+            .json()
+            .context("failed to decode Cohere response")?;
         let assistant_turn = assistant_turn_from_cohere(body.message)?;
 
         if self.verbose() {
@@ -269,8 +272,10 @@ impl CohereClient {
 
         if !pending_delta.is_empty() {
             flush_count += 1;
-            sink.emit(RuntimeEvent::AssistantDelta { delta: pending_delta.clone() })
-                .await?;
+            sink.emit(RuntimeEvent::AssistantDelta {
+                delta: pending_delta.clone(),
+            })
+            .await?;
         }
 
         let message = full_message.trim().to_string();
@@ -411,7 +416,13 @@ fn message_to_cohere_json(message: &ChatMessage) -> Result<Value> {
             if !message.tool_calls.is_empty() {
                 object.insert(
                     "tool_calls".to_string(),
-                    Value::Array(message.tool_calls.iter().map(tool_call_to_cohere_json).collect()),
+                    Value::Array(
+                        message
+                            .tool_calls
+                            .iter()
+                            .map(tool_call_to_cohere_json)
+                            .collect(),
+                    ),
                 );
             }
             Value::Object(object)
@@ -476,7 +487,10 @@ fn assistant_turn_from_cohere(message: CohereMessage) -> Result<AssistantTurn> {
     }
 
     let content = (!text.trim().is_empty()).then_some(text);
-    Ok(AssistantTurn { content, tool_calls })
+    Ok(AssistantTurn {
+        content,
+        tool_calls,
+    })
 }
 
 #[derive(Debug, Deserialize)]

@@ -98,11 +98,9 @@ impl AgentProviderKind {
                 "claude-3-5-haiku-latest",
                 "claude-3-5-sonnet-latest",
             ),
-            Self::Gemini => ModelTiers::new(
-                "gemini-1.5-flash",
-                "gemini-1.5-flash-8b",
-                "gemini-1.5-pro",
-            ),
+            Self::Gemini => {
+                ModelTiers::new("gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro")
+            }
             Self::Cohere => ModelTiers::new("command-r-plus", "command-r", "command-r-plus"),
             Self::Bedrock => ModelTiers::new(
                 "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -124,11 +122,9 @@ impl AgentProviderKind {
                 "mistral-large-latest",
             ),
             Self::Ollama => ModelTiers::new("llama3.2", "llama3.2", "llama3.2"),
-            Self::OpenRouter => ModelTiers::new(
-                "openai/gpt-4o",
-                "openai/gpt-4o-mini",
-                "openai/gpt-4o",
-            ),
+            Self::OpenRouter => {
+                ModelTiers::new("openai/gpt-4o", "openai/gpt-4o-mini", "openai/gpt-4o")
+            }
             Self::Kimi => ModelTiers::new("moonshot-v1-8k", "moonshot-v1-8k", "moonshot-v1-128k"),
             Self::Custom(_) => ModelTiers::new("", "", ""),
         }

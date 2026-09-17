@@ -84,7 +84,10 @@ where
             .run(self.agent.as_ref(), task)
             .await
             .with_context(|| {
-                format!("sub-agent delegation via tool '{}' failed", self.definition.name)
+                format!(
+                    "sub-agent delegation via tool '{}' failed",
+                    self.definition.name
+                )
             })?;
 
         Ok(ToolOutput {

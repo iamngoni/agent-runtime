@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::anthropic::AnthropicClientConfig;
 use crate::bedrock::BedrockClientConfig;
@@ -197,6 +198,35 @@ impl Llm {
             .await?;
         serde_json::from_value(value)
             .context("failed to deserialize structured response into the requested type")
+    }
+
+    /// Like [`run_structured`](Llm::run_structured) but takes the response
+    /// format from the caller instead of deriving it from a Rust type.
+    ///
+    /// This is the dynamic-schema entry point: callers that only know their
+    /// schema at runtime (for example a service adapting to an external
+    /// decision contract) can constrain the model to it and receive the parsed
+    /// JSON value. No tool-gathering pass runs; the request is already the
+    /// constrained one.
+    pub async fn run_structured_with_format(
+        &self,
+        agent: &dyn Agent,
+        input: impl Into<String>,
+        format: ResponseFormat,
+    ) -> Result<Value> {
+        let instructions = agent.instructions();
+        let model = {
+            let chosen = agent.model();
+            if chosen.is_empty() {
+                self.model_for(ModelTier::Default).to_string()
+            } else {
+                chosen
+            }
+        };
+        let messages = vec![ChatMessage::user(input.into())];
+        self.provider
+            .request_structured(&model, &instructions, &messages, &format)
+            .await
     }
 
     /// Like [`run`](Llm::run) but streams assistant tokens to `sink` as they

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use web_time::Instant;
 use tracing::info;
+use web_time::Instant;
 
 use crate::{
     AgentProvider, AssistantTurn, ChatMessage, EventSink, RuntimeEvent, ToolCall, ToolOutput,
