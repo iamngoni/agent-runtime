@@ -16,7 +16,7 @@ use crate::cohere::CohereClientConfig;
 use crate::error::RetryPolicy;
 use crate::gemini::GeminiClientConfig;
 use crate::http::{HttpClient, SharedHttpClient};
-use crate::openai::OpenAiClientConfig;
+use crate::openai::{OpenAiClientConfig, StructuredStrategy};
 use crate::provider::{ModelTier, ModelTiers, TextProvider};
 use crate::{
     Agent, AgentProviderKind, AnthropicClient, AssistantTurn, BedrockClient, ChatMessage,
@@ -41,6 +41,7 @@ pub struct LlmBuilder {
     model_tiers: Option<ModelTiers>,
     max_tokens: Option<u32>,
     retry: RetryPolicy,
+    structured_strategy: StructuredStrategy,
     config: LlmConfig,
 }
 
@@ -458,6 +459,20 @@ impl LlmBuilder {
         self
     }
 
+    /// Chooses how the structured path asks for a schema-shaped answer.
+    ///
+    /// Defaults to [`StructuredStrategy::ForcedTool`]. Select
+    /// [`StructuredStrategy::AutoTool`] for reasoning ("thinking") models,
+    /// which reject a compelled `tool_choice` outright — DeepSeek's V4 family
+    /// answers `400 Thinking mode does not support this tool_choice`.
+    ///
+    /// Only OpenAI-compatible providers read this; the Anthropic path keeps
+    /// its own compelled choice.
+    pub fn structured_strategy(mut self, strategy: StructuredStrategy) -> Self {
+        self.structured_strategy = strategy;
+        self
+    }
+
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.config.verbose = verbose;
         self
@@ -560,6 +575,7 @@ impl LlmBuilder {
                     verbose: self.config.verbose,
                     max_completion_tokens: None,
                     reasoning_effort: None,
+                    structured_strategy: self.structured_strategy,
                 };
                 Arc::new(OpenAiClient::with_config(http_client, api_key, config))
             }

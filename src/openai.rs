@@ -47,6 +47,33 @@ pub struct OpenAiClientConfig {
     /// see [`OpenAiClient::apply_reasoning_effort`]. `None` sends nothing
     /// (provider/model default).
     pub reasoning_effort: Option<String>,
+    /// How the structured path asks the model for a schema-shaped answer.
+    /// Defaults to [`StructuredStrategy::ForcedTool`], the behaviour every
+    /// existing caller already depends on.
+    pub structured_strategy: StructuredStrategy,
+}
+
+/// How [`OpenAiClient`] obtains a schema-conformant answer.
+///
+/// Both variants declare one synthetic function whose parameters are the
+/// requested schema; they differ only in whether the call is compelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StructuredStrategy {
+    /// `tool_choice: {"type":"function",...}` — the provider guarantees the
+    /// call, so an answer is always schema-shaped.
+    ///
+    /// Reasoning ("thinking") models reject a compelled choice: DeepSeek's V4
+    /// family answers `400 Thinking mode does not support this tool_choice`,
+    /// which fails every request rather than degrading.
+    #[default]
+    ForcedTool,
+    /// `tool_choice: "auto"` — the model decides, which thinking models accept.
+    ///
+    /// With a single tool that is the only answer channel there is nothing
+    /// else for the model to do, and it calls it in practice. The guarantee is
+    /// nonetheless advisory, so the response path also reads a JSON `content`
+    /// body when no call is returned.
+    AutoTool,
 }
 
 impl Default for OpenAiClientConfig {
@@ -79,6 +106,7 @@ impl OpenAiClientConfig {
             verbose: false,
             max_completion_tokens: None,
             reasoning_effort: None,
+            structured_strategy: StructuredStrategy::default(),
         }
     }
 
@@ -94,6 +122,7 @@ impl OpenAiClientConfig {
             verbose: false,
             max_completion_tokens: None,
             reasoning_effort: None,
+            structured_strategy: StructuredStrategy::default(),
         }
     }
 
@@ -190,6 +219,40 @@ impl OpenAiClient {
                 payload.insert("reasoning_effort".to_string(), json!(effort));
             }
         }
+    }
+
+    /// The `tool_choice` value for one strategy and schema name.
+    fn structured_tool_choice(strategy: StructuredStrategy, schema_name: &str) -> Value {
+        match strategy {
+            StructuredStrategy::ForcedTool => {
+                json!({ "type": "function", "function": { "name": schema_name } })
+            }
+            StructuredStrategy::AutoTool => Value::String("auto".to_string()),
+        }
+    }
+
+    /// The schema-shaped answer carried by one assistant turn.
+    ///
+    /// A tool call is the expected channel. Falling back to a JSON body covers
+    /// the model answering directly under `auto`, and any provider that drops
+    /// the call but still returns the text.
+    fn answer_from_turn(turn: AssistantTurn) -> Result<Value> {
+        if let Some(call) = turn.tool_calls.into_iter().next() {
+            return Ok(call.arguments);
+        }
+        if let Some(content) = turn.content.as_deref() {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return serde_json::from_str(trimmed).with_context(|| {
+                    format!(
+                        "structured response contained neither a tool call nor JSON content \
+                         (first 120 chars: {})",
+                        trimmed.chars().take(120).collect::<String>()
+                    )
+                });
+            }
+        }
+        Err(anyhow!("structured response did not contain a tool call"))
     }
 
     /// Send a buffered request with retry + typed error classification.
@@ -319,8 +382,10 @@ impl OpenAiClient {
             );
         }
 
-        // Force a single synthetic function whose parameters are the requested
-        // schema; `tool_choice: function` requires the model to call it.
+        // One synthetic function whose parameters are the requested schema. It
+        // is not a capability the model might want but the channel the answer
+        // travels through, so the strategy only decides whether taking it is
+        // compelled or merely the obvious thing to do.
         let response_tool = ToolDefinition {
             name: format.name.clone(),
             description: format.description.clone(),
@@ -338,7 +403,7 @@ impl OpenAiClient {
         self.apply_reasoning_effort(&mut request_payload);
         request_payload.insert(
             "tool_choice".to_string(),
-            json!({ "type": "function", "function": { "name": format.name } }),
+            Self::structured_tool_choice(self.config.structured_strategy, &format.name),
         );
 
         let request = self
@@ -369,12 +434,7 @@ impl OpenAiClient {
             );
         }
 
-        assistant_turn
-            .tool_calls
-            .into_iter()
-            .next()
-            .map(|call| call.arguments)
-            .ok_or_else(|| anyhow!("structured response did not contain a tool call"))
+        Self::answer_from_turn(assistant_turn)
     }
 
     async fn stream_message_impl(
@@ -912,8 +972,8 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        OpenAiAssistantMessage, OpenAiClient, OpenAiClientConfig, parse_openai_stream_event,
-        tool_call_to_openai_json,
+        OpenAiAssistantMessage, OpenAiClient, OpenAiClientConfig, StructuredStrategy,
+        parse_openai_stream_event, tool_call_to_openai_json,
     };
     use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse};
     use crate::provider::AgentProviderKind;
@@ -1042,6 +1102,68 @@ mod tests {
             config.embeddings_url(),
             "https://api.moonshot.cn/v1/embeddings"
         );
+    }
+
+    #[test]
+    fn forced_strategy_compels_the_answer_channel_and_auto_does_not() {
+        assert_eq!(
+            OpenAiClient::structured_tool_choice(StructuredStrategy::ForcedTool, "veyra_step"),
+            json!({ "type": "function", "function": { "name": "veyra_step" } })
+        );
+        assert_eq!(
+            OpenAiClient::structured_tool_choice(StructuredStrategy::AutoTool, "veyra_step"),
+            json!("auto")
+        );
+        // Callers that never opt in keep the compelled call they rely on.
+        assert_eq!(
+            OpenAiClientConfig::for_kind(AgentProviderKind::OpenAi).structured_strategy,
+            StructuredStrategy::ForcedTool
+        );
+    }
+
+    #[test]
+    fn a_tool_call_is_the_answer_and_a_json_body_is_the_fallback() {
+        let call = AssistantTurn {
+            content: Some("ignored when a call is present".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "1".to_string(),
+                name: "veyra_step".to_string(),
+                arguments: json!({ "action": "none" }),
+            }],
+        };
+        assert_eq!(
+            OpenAiClient::answer_from_turn(call).unwrap(),
+            json!({ "action": "none" })
+        );
+
+        // Under `auto` the model may answer directly; that is still an answer.
+        let body = AssistantTurn {
+            content: Some("  {\"action\":\"open\"}  ".to_string()),
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(
+            OpenAiClient::answer_from_turn(body).unwrap(),
+            json!({ "action": "open" })
+        );
+    }
+
+    #[test]
+    fn prose_without_a_call_fails_loudly_and_quotes_what_arrived() {
+        let prose = AssistantTurn {
+            content: Some("I think we should probably wait and see.".to_string()),
+            tool_calls: Vec::new(),
+        };
+        let error = OpenAiClient::answer_from_turn(prose)
+            .unwrap_err()
+            .to_string();
+        // The text is quoted so the failure is diagnosable from the log alone.
+        assert!(error.contains("I think we should probably wait"), "{error}");
+
+        let empty = AssistantTurn {
+            content: None,
+            tool_calls: Vec::new(),
+        };
+        assert!(OpenAiClient::answer_from_turn(empty).is_err());
     }
 
     #[test]

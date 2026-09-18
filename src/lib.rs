@@ -38,7 +38,10 @@ pub use llm::{Llm, LlmBuilder, LlmConfig};
 pub use message::{
     AssistantTurn, Attachment, AttachmentKind, AttachmentSource, ChatMessage, MessageRole,
 };
-pub use openai::{OpenAiClient, OpenAiClientConfig, ParsedStreamEvent, parse_openai_stream_event};
+pub use openai::{
+    OpenAiClient, OpenAiClientConfig, ParsedStreamEvent, StructuredStrategy,
+    parse_openai_stream_event,
+};
 /// Backward-compatible alias for the text-generation capability trait, which
 /// was previously the monolithic provider trait. Prefer [`TextProvider`].
 pub use provider::TextProvider as AgentProvider;
