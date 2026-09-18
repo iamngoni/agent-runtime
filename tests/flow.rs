@@ -519,6 +519,94 @@ async fn run_structured_with_format_sends_caller_schema() -> Result<()> {
     Ok(())
 }
 
+/// A model that writes a stray closing brace costs a retry, not the answer.
+///
+/// Observed in production against `deepseek/deepseek-v4.1-flash`: a complete,
+/// schema-correct answer followed by one extra `}`, which fails the parse as
+/// "trailing characters". The answer itself was never in doubt, so asking again
+/// is the proportionate response.
+#[tokio::test]
+async fn run_structured_retries_an_unparseable_answer() -> Result<()> {
+    let mock = MockHttpClient::new();
+    let response = |arguments: &str| {
+        json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_f",
+                        "type": "function",
+                        "function": { "name": "trade_intent", "arguments": arguments }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    };
+    // Trailing brace: valid answer, invalid JSON.
+    mock.push_buffered(200, response("{\"side\":\"buy\",\"lots\":0.1}}"));
+    mock.push_buffered(200, response("{\"side\":\"buy\",\"lots\":0.1}"));
+    let llm = build_llm(mock.clone());
+
+    let format = ResponseFormat::new(
+        "trade_intent",
+        json!({
+            "type": "object",
+            "properties": {
+                "side": {"type": "string", "enum": ["buy", "sell"]},
+                "lots": {"type": "number"}
+            },
+            "required": ["side", "lots"]
+        }),
+    );
+
+    let value = llm
+        .run_structured_with_format(&SummarizerAgent, "propose a trade", format)
+        .await?;
+
+    assert_eq!(value["side"], "buy");
+    assert_eq!(value["lots"], 0.1);
+    assert_eq!(mock.request_count(), 2, "the bad answer should cost a retry");
+    Ok(())
+}
+
+/// Two unparseable answers give up rather than asking forever.
+#[tokio::test]
+async fn run_structured_stops_after_the_attempt_cap() -> Result<()> {
+    let mock = MockHttpClient::new();
+    let bad = json!({
+        "choices": [{
+            "finish_reason": "length",
+            "message": {
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_f",
+                    "type": "function",
+                    "function": { "name": "trade_intent", "arguments": "{\"side\":\"bu" }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    mock.push_buffered(200, bad.clone());
+    mock.push_buffered(200, bad);
+    let llm = build_llm(mock.clone());
+
+    let format = ResponseFormat::new("trade_intent", json!({"type": "object"}));
+    let error = llm
+        .run_structured_with_format(&SummarizerAgent, "propose a trade", format)
+        .await
+        .expect_err("an unreadable answer must not be reported as success");
+
+    // The reported cause carries finish_reason, which separates a truncated
+    // answer from a malformed one without another round trip.
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("length"), "error: {rendered}");
+    assert_eq!(mock.request_count(), 2, "attempts are capped");
+    Ok(())
+}
+
 #[tokio::test]
 async fn run_structured_returns_typed_payload() -> Result<()> {
     let mock = MockHttpClient::new();

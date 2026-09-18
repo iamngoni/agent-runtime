@@ -17,6 +17,14 @@ use crate::{
     ToolDefinition,
 };
 
+/// How many times a structured answer is requested before giving up.
+///
+/// Covers the one failure this retry exists for: a model that returns a
+/// well-formed response whose generated answer text does not parse. Transport
+/// faults are already retried by [`execute_with_retry`], so this counts only
+/// attempts lost to unreadable output.
+const STRUCTURED_ANSWER_ATTEMPTS: u32 = 2;
+
 /// Configuration for an OpenAI-compatible provider. The same client drives
 /// OpenAI, Groq, DeepSeek, xAI, Mistral, Ollama, OpenRouter and any other
 /// endpoint that speaks the `/chat/completions` wire format — they differ only
@@ -236,6 +244,25 @@ impl OpenAiClient {
     /// A tool call is the expected channel. Falling back to a JSON body covers
     /// the model answering directly under `auto`, and any provider that drops
     /// the call but still returns the text.
+    /// Reads the first choice into a turn, naming `finish_reason` when it fails.
+    ///
+    /// A malformed tool-argument string and a truncated one produce the same
+    /// parse error, so the error alone cannot tell them apart. `finish_reason`
+    /// can: `length` means the provider stopped mid-write and the answer was
+    /// never complete, anything else means it considered the answer finished
+    /// and sent it that way.
+    fn turn_from_choices(choices: Vec<ToolChatCompletionChoice>) -> Result<AssistantTurn> {
+        let choice = choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("response did not contain a choice"))?;
+        let finish_reason = choice
+            .finish_reason
+            .unwrap_or_else(|| "unreported".to_string());
+        AssistantTurn::try_from(choice.message)
+            .with_context(|| format!("finish_reason: {finish_reason}"))
+    }
+
     fn answer_from_turn(turn: AssistantTurn) -> Result<Value> {
         if let Some(call) = turn.tool_calls.into_iter().next() {
             return Ok(call.arguments);
@@ -330,13 +357,8 @@ impl OpenAiClient {
             .json()
             .context("failed to decode assistant tool response")?;
 
-        let assistant_turn: AssistantTurn = body
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.try_into())
-            .transpose()?
-            .ok_or_else(|| anyhow!("assistant response did not contain a choice"))?;
+        let assistant_turn: AssistantTurn =
+            Self::turn_from_choices(body.choices).context("assistant turn could not be read")?;
 
         if self.verbose() {
             info!(
@@ -406,35 +428,57 @@ impl OpenAiClient {
             Self::structured_tool_choice(self.config.structured_strategy, &format.name),
         );
 
-        let request = self
-            .prepare(HttpRequest::post(self.config.chat_completions_url()))
-            .json_body(&Value::Object(request_payload))?;
-        let response = self
-            .send_classified(request)
-            .await
-            .context("failed to call OpenAI-compatible provider for structured output")?;
+        // A model that writes an unparseable answer usually writes a clean one
+        // when asked again: the fault is in the generated text, not the request.
+        // Retrying here keeps a transient malformation from costing the caller a
+        // decision, while a fixed cap keeps a genuinely broken model from
+        // turning every call into several.
+        let mut last_error = None;
+        for attempt in 1..=STRUCTURED_ANSWER_ATTEMPTS {
+            let request = self
+                .prepare(HttpRequest::post(self.config.chat_completions_url()))
+                .json_body(&Value::Object(request_payload.clone()))?;
+            let response = self
+                .send_classified(request)
+                .await
+                .context("failed to call OpenAI-compatible provider for structured output")?;
 
-        let body: ToolChatCompletionResponse = response
-            .json()
-            .context("failed to decode structured tool response")?;
-        let assistant_turn: AssistantTurn = body
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.try_into())
-            .transpose()?
-            .ok_or_else(|| anyhow!("structured response did not contain a choice"))?;
+            let body: ToolChatCompletionResponse = response
+                .json()
+                .context("failed to decode structured tool response")?;
 
-        if self.verbose() {
-            info!(
-                provider = self.provider_name(),
-                model = %model,
-                duration_ms = request_started_at.elapsed().as_millis() as u64,
-                "structured output completed"
-            );
+            let answer = Self::turn_from_choices(body.choices)
+                .and_then(Self::answer_from_turn)
+                .context("structured output could not be read");
+
+            match answer {
+                Ok(answer) => {
+                    if self.verbose() {
+                        info!(
+                            provider = self.provider_name(),
+                            model = %model,
+                            duration_ms = request_started_at.elapsed().as_millis() as u64,
+                            attempt,
+                            "structured output completed"
+                        );
+                    }
+                    return Ok(answer);
+                }
+                Err(error) => {
+                    warn!(
+                        provider = self.provider_name(),
+                        model = %model,
+                        attempt,
+                        attempts = STRUCTURED_ANSWER_ATTEMPTS,
+                        error = %format!("{error:#}"),
+                        "structured answer unreadable; retrying"
+                    );
+                    last_error = Some(error);
+                }
+            }
         }
 
-        Self::answer_from_turn(assistant_turn)
+        Err(last_error.unwrap_or_else(|| anyhow!("structured output could not be read")))
     }
 
     async fn stream_message_impl(
@@ -926,6 +970,12 @@ struct ToolChatCompletionResponse {
 #[derive(Debug, Deserialize)]
 struct ToolChatCompletionChoice {
     message: OpenAiAssistantMessage,
+    /// Why generation stopped. `length` means the answer was cut off, which is
+    /// the difference between "the model wrote bad JSON" and "the model wrote
+    /// good JSON we only received half of" — indistinguishable from the parse
+    /// error alone, and the first question worth asking when one arrives.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
