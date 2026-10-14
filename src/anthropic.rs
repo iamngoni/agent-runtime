@@ -132,7 +132,8 @@ impl AnthropicClient {
         tool_definitions: &[ToolDefinition],
     ) -> Result<AssistantTurn> {
         let request_started_at = Instant::now();
-        let messages = messages_to_anthropic_json(history)?;
+        let mut messages = messages_to_anthropic_json(history)?;
+        mark_cache_breakpoint(&mut messages);
 
         if self.verbose() {
             info!(
@@ -147,10 +148,7 @@ impl AnthropicClient {
         let mut request_payload = Map::new();
         request_payload.insert("model".to_string(), Value::String(model.to_string()));
         request_payload.insert("max_tokens".to_string(), json!(self.config.max_tokens));
-        request_payload.insert(
-            "system".to_string(),
-            Value::String(system_prompt.to_string()),
-        );
+        request_payload.insert("system".to_string(), cached_system(system_prompt));
         request_payload.insert("messages".to_string(), Value::Array(messages));
         if !tool_definitions.is_empty() {
             request_payload.insert(
@@ -531,6 +529,41 @@ fn anthropic_tools(definitions: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// The system prompt as a cached block. Anthropic caches the prefix up to each
+/// breakpoint, so this one covers the tool definitions and the system prompt.
+fn cached_system(system_prompt: &str) -> Value {
+    if system_prompt.is_empty() {
+        return Value::String(String::new());
+    }
+    json!([{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": { "type": "ephemeral" },
+    }])
+}
+
+/// Marks the newest message as a cache breakpoint. In a tool loop each request
+/// repeats the previous one plus a turn, so the next request reads everything
+/// up to here from the cache instead of paying for the whole history again.
+fn mark_cache_breakpoint(messages: &mut [Value]) {
+    let Some(content) = messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+    else {
+        return;
+    };
+    if let Value::String(text) = content {
+        if text.is_empty() {
+            return;
+        }
+        *content = json!([{ "type": "text", "text": text.clone() }]);
+    }
+    if let Some(Value::Object(block)) = content.as_array_mut().and_then(|blocks| blocks.last_mut())
+    {
+        block.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+}
+
 fn messages_to_anthropic_json(messages: &[ChatMessage]) -> Result<Vec<Value>> {
     let mut converted = Vec::new();
     let mut index = 0usize;
@@ -737,7 +770,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AnthropicParsedStreamEvent, messages_to_anthropic_json, parse_anthropic_stream_event,
+        AnthropicParsedStreamEvent, cached_system, mark_cache_breakpoint,
+        messages_to_anthropic_json, parse_anthropic_stream_event,
     };
     use crate::{ChatMessage, ToolCall};
 
@@ -760,6 +794,41 @@ mod tests {
         assert_eq!(converted[0]["role"], json!("assistant"));
         assert_eq!(converted[1]["role"], json!("user"));
         assert_eq!(converted[1]["content"][0]["type"], json!("tool_result"));
+        Ok(())
+    }
+
+    #[test]
+    fn marks_the_newest_message_as_a_cache_breakpoint() -> Result<()> {
+        let mut converted = messages_to_anthropic_json(&[
+            ChatMessage::user("Fix the build."),
+            ChatMessage::assistant_with_tools(
+                None,
+                vec![ToolCall {
+                    id: "toolu_01".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "a.rs" }),
+                }],
+            ),
+            ChatMessage::tool("toolu_01", "fn main() {}"),
+        ])?;
+        mark_cache_breakpoint(&mut converted);
+        assert!(converted[0]["content"].is_string());
+        assert_eq!(
+            converted[2]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+
+        let mut first = messages_to_anthropic_json(&[ChatMessage::user("Fix the build.")])?;
+        mark_cache_breakpoint(&mut first);
+        assert_eq!(first[0]["content"][0]["text"], json!("Fix the build."));
+        assert_eq!(
+            first[0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            cached_system("You fix CI.")[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
         Ok(())
     }
 

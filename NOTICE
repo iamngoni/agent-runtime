@@ -1,0 +1,5 @@
+agent-runtime
+
+This product includes software adapted from aster
+(https://github.com/Zfinix/aster), licensed under the Apache License,
+Version 2.0. See src/tool_args.rs.

@@ -251,11 +251,28 @@ impl OpenAiClient {
     /// can: `length` means the provider stopped mid-write and the answer was
     /// never complete, anything else means it considered the answer finished
     /// and sent it that way.
-    fn turn_from_choices(choices: Vec<ToolChatCompletionChoice>) -> Result<AssistantTurn> {
-        let choice = choices
+    ///
+    /// The tool loop repairs malformed arguments (see [`crate::tool_args`]): the
+    /// tool then rejects what is missing and the model tries again. Structured
+    /// answers stay strict, since a repaired answer could be a wrong one.
+    fn turn_from_choices(
+        choices: Vec<ToolChatCompletionChoice>,
+        repair: bool,
+    ) -> Result<AssistantTurn> {
+        let mut choice = choices
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("response did not contain a choice"))?;
+        if repair {
+            for call in &mut choice.message.tool_calls {
+                if let OpenAiToolArgumentsWire::JsonString(raw) = &call.function.arguments
+                    && serde_json::from_str::<Value>(raw.trim()).is_err()
+                {
+                    call.function.arguments =
+                        OpenAiToolArgumentsWire::JsonValue(crate::tool_args::heal(raw));
+                }
+            }
+        }
         let finish_reason = choice
             .finish_reason
             .unwrap_or_else(|| "unreported".to_string());
@@ -357,8 +374,8 @@ impl OpenAiClient {
             .json()
             .context("failed to decode assistant tool response")?;
 
-        let assistant_turn: AssistantTurn =
-            Self::turn_from_choices(body.choices).context("assistant turn could not be read")?;
+        let assistant_turn: AssistantTurn = Self::turn_from_choices(body.choices, true)
+            .context("assistant turn could not be read")?;
 
         if self.verbose() {
             info!(
@@ -447,7 +464,7 @@ impl OpenAiClient {
                 .json()
                 .context("failed to decode structured tool response")?;
 
-            let answer = Self::turn_from_choices(body.choices)
+            let answer = Self::turn_from_choices(body.choices, false)
                 .and_then(Self::answer_from_turn)
                 .context("structured output could not be read");
 

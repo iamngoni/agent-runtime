@@ -16,6 +16,7 @@ mod store;
 mod streaming;
 mod structured;
 mod tool;
+mod tool_args;
 
 pub use agent::Agent;
 pub use anthropic::{
@@ -56,3 +57,4 @@ pub use store::{ConversationStore, InMemoryConversationStore};
 pub use streaming::should_flush_delta;
 pub use structured::{ResponseFormat, response_schema_for};
 pub use tool::{JsonTool, Tool, ToolCall, ToolDefinition, ToolOutput, ToolRegistry};
+pub use tool_args::heal as heal_tool_arguments;

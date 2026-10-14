@@ -567,7 +567,11 @@ async fn run_structured_retries_an_unparseable_answer() -> Result<()> {
 
     assert_eq!(value["side"], "buy");
     assert_eq!(value["lots"], 0.1);
-    assert_eq!(mock.request_count(), 2, "the bad answer should cost a retry");
+    assert_eq!(
+        mock.request_count(),
+        2,
+        "the bad answer should cost a retry"
+    );
     Ok(())
 }
 
