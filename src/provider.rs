@@ -278,6 +278,23 @@ pub trait TextProvider: ProviderInfo {
         sink: &mut dyn EventSink,
     ) -> Result<String>;
 
+    /// Stream a message while still declaring the tools used earlier in the
+    /// conversation. Providers that require tool declarations alongside
+    /// `tool_use`/`tool_result` blocks (Anthropic, Bedrock) override this so a
+    /// follow-up after a tool call is accepted. The default ignores the
+    /// definitions, which is correct for providers that don't need them.
+    async fn stream_message_with_tools(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        _tool_definitions: &[ToolDefinition],
+        sink: &mut dyn EventSink,
+    ) -> Result<String> {
+        self.stream_message(model, system_prompt, messages, sink)
+            .await
+    }
+
     /// Request a response constrained to `format`'s JSON Schema, returning the
     /// structured value. Backends that support forced/structured output
     /// (Anthropic, OpenAI-compatible) override this; the default reports the

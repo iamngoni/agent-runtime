@@ -252,10 +252,11 @@ where
         build_followup_messages(request.history, &assistant_turn, &executed_tool_calls)?;
 
     let message = provider
-        .stream_message(
+        .stream_message_with_tools(
             request.model,
             request.followup_system_prompt,
             &followup_messages,
+            &request.tool_registry.definitions(),
             sink,
         )
         .await?;

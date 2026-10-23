@@ -239,6 +239,32 @@ impl TextProvider for BedrockClient {
         messages: &[ChatMessage],
         sink: &mut dyn EventSink,
     ) -> Result<String> {
+        self.stream_message_impl(model, system_prompt, messages, &[], sink)
+            .await
+    }
+
+    async fn stream_message_with_tools(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tool_definitions: &[ToolDefinition],
+        sink: &mut dyn EventSink,
+    ) -> Result<String> {
+        self.stream_message_impl(model, system_prompt, messages, tool_definitions, sink)
+            .await
+    }
+}
+
+impl BedrockClient {
+    async fn stream_message_impl(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tool_definitions: &[ToolDefinition],
+        sink: &mut dyn EventSink,
+    ) -> Result<String> {
         // First-cut: buffer a single Converse call and emit it as one delta.
         // See the module-level note on Bedrock's binary event-stream protocol.
         sink.emit(RuntimeEvent::AssistantStarted {
@@ -246,7 +272,12 @@ impl TextProvider for BedrockClient {
         })
         .await?;
 
-        let turn = self.converse(model, system_prompt, messages, &[]).await?;
+        // Converse rejects `toolUse`/`toolResult` blocks unless the request
+        // also carries `toolConfig`, so a follow-up after a tool call keeps
+        // the definitions.
+        let turn = self
+            .converse(model, system_prompt, messages, tool_definitions)
+            .await?;
         let message = turn.content.unwrap_or_default().trim().to_string();
         if message.is_empty() {
             return Err(anyhow!("Bedrock returned an empty message"));
