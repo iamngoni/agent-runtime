@@ -11,7 +11,7 @@ use agent_runtime::ResponseFormat;
 use agent_runtime::{
     Agent, AgentProviderKind, AgentTool, ChatMessage, EventSink, HttpByteStream, HttpClient,
     HttpRequest, HttpResponse, HttpStreamResponse, JsonTool, Llm, RetryPolicy, RuntimeEvent,
-    ToolRegistry, ToolSessionOutcome, ToolSessionRequest,
+    Timeouts, ToolRegistry, ToolSessionOutcome, ToolSessionRequest,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -920,6 +920,106 @@ async fn max_completion_tokens_reaches_the_openai_wire() -> Result<()> {
     assert!(
         sent.contains("\"max_completion_tokens\":4096"),
         "request body: {sent}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_socket_that_accepts_and_stays_silent_ends_in_a_typed_timeout() -> Result<()> {
+    use std::time::Duration;
+
+    // A real TCP listener: it accepts the connection, reads nothing and never
+    // writes a response, exactly the server that used to hang forever.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("one connection");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(socket);
+    });
+
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .base_url(format!("http://{address}/v1"))
+        .timeouts(Timeouts::none().response_headers(Some(Duration::from_millis(200))))
+        .build()?;
+
+    let started = std::time::Instant::now();
+    let error = llm
+        .request_assistant_turn("gpt-4o", "sys", &[ChatMessage::user("hi")], &[])
+        .await
+        .expect_err("a silent server must time out");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the timeout must fire promptly, not hang"
+    );
+    let provider_error = error
+        .chain()
+        .find_map(|error| error.downcast_ref::<agent_runtime::ProviderError>())
+        .expect("typed provider error");
+    assert!(matches!(
+        provider_error,
+        agent_runtime::ProviderError::Timeout {
+            stage: agent_runtime::TimeoutStage::ResponseHeaders,
+            ..
+        }
+    ));
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_the_streaming_future_drops_the_transport_future() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct HangingFuture {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl HttpClient for HangingFuture {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse> {
+            Err(anyhow::anyhow!("buffered call unused"))
+        }
+
+        async fn send_streaming(&self, _request: HttpRequest) -> Result<HttpStreamResponse> {
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending::<Result<HttpStreamResponse>>().await
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .with_http_client(HangingFuture {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        })
+        .timeouts(Timeouts::none())
+        .build()?;
+
+    let mut sink = RecordingSink::default();
+    let messages = [ChatMessage::user("hi")];
+    let mut future = Box::pin(llm.stream_message("gpt-4o", "be brief", &messages, &mut sink));
+    tokio::select! {
+        _ = &mut future => panic!("the transport must not answer"),
+        _ = started.notified() => {}
+    }
+    drop(future);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "dropping the streaming future must drop the transport future"
     );
     Ok(())
 }

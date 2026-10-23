@@ -127,16 +127,18 @@ impl Timeouts {
     }
 
     /// The limit on receiving the response status + headers: the tighter of
-    /// the header limit and the optional overall deadline.
+    /// the header limit and the optional overall deadline. The stage is the
+    /// one that actually elapsed, so a total deadline stays non-retryable
+    /// even when it fires before the headers arrive.
     fn headers_limit(&self) -> Option<(TimeoutStage, Duration)> {
-        match (self.response_headers, self.total) {
-            (Some(headers), Some(total)) if total < headers => {
-                Some((TimeoutStage::ResponseHeaders, total))
-            }
-            (Some(headers), _) => Some((TimeoutStage::ResponseHeaders, headers)),
-            (None, Some(total)) => Some((TimeoutStage::ResponseHeaders, total)),
-            (None, None) => None,
-        }
+        [
+            self.response_headers
+                .map(|after| (TimeoutStage::ResponseHeaders, after)),
+            self.total.map(|after| (TimeoutStage::Total, after)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(|a, b| a.1.cmp(&b.1))
     }
 }
 
@@ -366,6 +368,19 @@ mod tests {
             .next()
             .await
             .expect("a chunk")
+            .expect_err("a total deadline must fire");
+        assert_eq!(timeout_of(&error).stage, super::TimeoutStage::Total);
+    }
+
+    #[tokio::test]
+    async fn a_total_deadline_alone_keeps_its_total_stage() {
+        let client = TimeoutHttpClient::new(
+            Arc::new(Silent),
+            Timeouts::none().total(Some(Duration::from_millis(30))),
+        );
+        let error = client
+            .send(HttpRequest::post("http://example.test"))
+            .await
             .expect_err("a total deadline must fire");
         assert_eq!(timeout_of(&error).stage, super::TimeoutStage::Total);
     }
