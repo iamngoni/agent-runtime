@@ -36,6 +36,50 @@ pub enum AgentProviderKind {
 }
 
 impl AgentProviderKind {
+    /// The named providers this crate ships presets for, in the order a
+    /// settings screen should show them. [`Custom`](AgentProviderKind::Custom)
+    /// is not included: it needs a name and base URL from the caller.
+    pub const NAMED: &'static [AgentProviderKind] = &[
+        AgentProviderKind::OpenAi,
+        AgentProviderKind::Anthropic,
+        AgentProviderKind::Gemini,
+        AgentProviderKind::Groq,
+        AgentProviderKind::DeepSeek,
+        AgentProviderKind::Xai,
+        AgentProviderKind::Mistral,
+        AgentProviderKind::Cohere,
+        AgentProviderKind::Ollama,
+        AgentProviderKind::OpenRouter,
+        AgentProviderKind::Kimi,
+        AgentProviderKind::Bedrock,
+    ];
+
+    /// A human-readable name for a settings screen.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Google Gemini",
+            Self::Cohere => "Cohere",
+            Self::Bedrock => "AWS Bedrock",
+            Self::Groq => "Groq",
+            Self::DeepSeek => "DeepSeek",
+            Self::Xai => "xAI",
+            Self::Mistral => "Mistral",
+            Self::Ollama => "Ollama",
+            Self::OpenRouter => "OpenRouter",
+            Self::Kimi => "Kimi (Moonshot)",
+            Self::Custom(name) => name,
+        }
+    }
+
+    /// Whether the provider needs an API key at all. A local Ollama or an
+    /// anonymous gateway does not; a custom endpoint may or may not, so it is
+    /// reported as not requiring one.
+    pub fn requires_api_key(&self) -> bool {
+        !matches!(self, Self::Ollama | Self::Custom(_))
+    }
+
     /// Short, stable identifier for logging and `kind()`.
     pub fn as_str(&self) -> &str {
         match self {
@@ -143,6 +187,8 @@ impl FromStr for AgentProviderKind {
             "deepseek" => Self::DeepSeek,
             "xai" | "grok" => Self::Xai,
             "mistral" => Self::Mistral,
+            "cohere" => Self::Cohere,
+            "bedrock" | "aws" => Self::Bedrock,
             "ollama" => Self::Ollama,
             "openrouter" => Self::OpenRouter,
             "kimi" | "moonshot" => Self::Kimi,

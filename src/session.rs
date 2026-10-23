@@ -202,6 +202,14 @@ where
                 "tool session resolved directly without tool calls"
             );
         }
+        if !direct_message.is_empty() {
+            sink.emit(RuntimeEvent::AssistantDelta {
+                delta: direct_message.clone(),
+            })
+            .await?;
+        }
+        sink.emit(RuntimeEvent::AssistantEnded { complete: true })
+            .await?;
         return Ok(ToolSessionOutcome::Direct {
             assistant_turn,
             message: direct_message,
@@ -226,6 +234,14 @@ where
                 "tool session fell back to direct response because no tool calls executed"
             );
         }
+        if !direct_message.is_empty() {
+            sink.emit(RuntimeEvent::AssistantDelta {
+                delta: direct_message.clone(),
+            })
+            .await?;
+        }
+        sink.emit(RuntimeEvent::AssistantEnded { complete: true })
+            .await?;
         return Ok(ToolSessionOutcome::Direct {
             assistant_turn,
             message: direct_message,

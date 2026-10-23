@@ -141,6 +141,16 @@ Runnable, in [`examples/`](examples/) — `cargo run --example <name>`:
 
 ## Choosing a provider
 
+`AgentProviderKind::NAMED` lists the vendors with presets (for a settings
+screen), each with `label()`, `requires_api_key()`, a default base URL and
+model tiers:
+
+```rust
+for kind in agent_runtime::AgentProviderKind::NAMED {
+    println!("{} ({})", kind.label(), kind.as_str());
+}
+```
+
 Named vendors carry their own default base URL and model tiers — just pick one:
 
 ```rust
@@ -194,6 +204,43 @@ let llm = Llm::builder()
     .retry(RetryPolicy::with_retries(3)) // exponential backoff on retryable errors
     .build()?;
 ```
+
+## Timeouts & cancellation
+
+Every provider call is bounded: a server that accepts a connection and never
+answers fails with a typed `ProviderError::Timeout` instead of hanging. The
+limits live in `Timeouts` and apply to any `HttpClient`, including custom
+wasm ones:
+
+```rust
+use std::time::Duration;
+use agent_runtime::{Llm, Timeouts};
+
+let llm = Llm::builder()
+    .provider(agent_runtime::AgentProviderKind::OpenAi)
+    .api_key("…")
+    .timeouts(Timeouts::default()
+        .connect(Some(Duration::from_secs(10)))          // reqwest connect
+        .response_headers(Some(Duration::from_secs(30))) // status + headers
+        .idle(Some(Duration::from_secs(60)))             // between chunks
+        .total(Some(Duration::from_secs(180))))          // optional deadline
+    .build()?;
+```
+
+`response_headers` and `idle` are defaults, not opt-ins; the reqwest backend
+honours `connect` at the socket level and maps its own timeout errors onto the
+same typed error. Dropping a `stream_message` future (or a stream body) drops
+the response and aborts the request promptly — cancel by dropping.
+
+`LlmBuilder::max_completion_tokens(n)` sends `max_completion_tokens` on
+OpenAI-compatible requests, which newer OpenAI reasoning models require instead
+of `max_tokens`; `reasoning_effort("high")` sends the provider-appropriate
+effort field.
+
+Streamed turns end with `RuntimeEvent::AssistantEnded { complete }`. `complete`
+is false when the provider's stream stopped without its end marker (`[DONE]`
+for OpenAI, `message_stop` for Anthropic), so callers can show a truncated
+answer as cut off rather than finished.
 
 ## Embeddings
 
@@ -448,7 +495,8 @@ OpenAiClient   AnthropicClient      GeminiClient          │
 - **Capability traits** (à la Laravel AI's provider contracts): `ProviderInfo` carries identity + model tiers; `TextProvider` is text/tools/streaming; `EmbeddingProvider` is vectors. A provider implements only what it offers, so misuse (embeddings on a text-only provider) is a compile error. `AgentProvider` remains as a backward-compatible alias for `TextProvider`.
 - **One client, many vendors:** `OpenAiClient` is parameterised by base URL + headers, so Groq/DeepSeek/xAI/Mistral/Ollama/OpenRouter/custom all reuse the same wire code. Anthropic and Gemini have native clients.
 - `HttpClient` is the transport seam. Two methods: `send` (buffered) and `send_streaming` (chunked).
-- `ProviderError` + `RetryPolicy` classify failures and drive optional backoff/failover.
+- `ProviderError` + `RetryPolicy` classify failures (including typed `Timeout`s) and drive optional backoff/failover.
+- `Timeouts` + `TimeoutHttpClient` bound connect, response headers, stream idle and total time for any transport; dropping a call aborts it.
 - **`Llm` vs `Agent`:** `Llm` is the configured provider handle (was the old `Agent`); `Agent` is the declarative trait (instructions + tools). `llm.run(&agent, input)` binds them and hides the tool session. Drop to `llm.execute_tool_session(...)` for full control.
 - `EventSink` is the streaming-progress callback. Implement `emit` to ship deltas wherever (stdout, SSE, websocket).
 

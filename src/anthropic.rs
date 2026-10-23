@@ -302,7 +302,8 @@ impl AnthropicClient {
             .http_client
             .send_streaming(request)
             .await
-            .context("failed to call Anthropic streaming messages API")?;
+            .context("failed to call Anthropic streaming messages API")
+            .map_err(|error| ProviderError::transport(self.provider_name(), error))?;
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
@@ -402,6 +403,8 @@ impl AnthropicClient {
             );
         }
 
+        sink.emit(RuntimeEvent::AssistantEnded { complete: saw_done })
+            .await?;
         Ok(message)
     }
 }

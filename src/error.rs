@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use futures_util::future::Future;
 
+use crate::timeout::{HttpTimeout, TimeoutStage};
+
 /// A classified failure from an LLM provider call.
 #[derive(Debug)]
 pub enum ProviderError {
@@ -30,6 +32,14 @@ pub enum ProviderError {
         provider: String,
         status: u16,
         body: String,
+    },
+    /// A request exceeded a configured limit. Retryable for connect, header
+    /// and stream-idle timeouts; a total deadline means the caller ran out of
+    /// time, so retrying cannot help.
+    Timeout {
+        provider: String,
+        stage: TimeoutStage,
+        after: Duration,
     },
     /// The HTTP layer itself failed (connection reset, DNS, TLS…). Retryable.
     Transport {
@@ -66,12 +76,21 @@ impl ProviderError {
         }
     }
 
-    /// Wrap a transport-layer failure.
+    /// Wrap a transport-layer failure, keeping a typed timeout when the
+    /// transport (or the timeout wrapper) reported one.
     pub fn transport(provider: impl Into<String>, source: anyhow::Error) -> Self {
-        ProviderError::Transport {
-            provider: provider.into(),
-            source,
+        let provider = provider.into();
+        if let Some(timeout) = source
+            .chain()
+            .find_map(|error| error.downcast_ref::<HttpTimeout>())
+        {
+            return ProviderError::Timeout {
+                provider,
+                stage: timeout.stage,
+                after: timeout.after,
+            };
         }
+        ProviderError::Transport { provider, source }
     }
 
     /// Whether retrying the same request could plausibly succeed.
@@ -81,6 +100,12 @@ impl ProviderError {
             ProviderError::RateLimited { .. }
                 | ProviderError::Overloaded { .. }
                 | ProviderError::Transport { .. }
+                | ProviderError::Timeout {
+                    stage: TimeoutStage::Connect
+                        | TimeoutStage::ResponseHeaders
+                        | TimeoutStage::Idle,
+                    ..
+                }
         )
     }
 
@@ -91,6 +116,7 @@ impl ProviderError {
             | ProviderError::InsufficientCredits { provider, .. }
             | ProviderError::Overloaded { provider, .. }
             | ProviderError::Status { provider, .. }
+            | ProviderError::Timeout { provider, .. }
             | ProviderError::Transport { provider, .. }
             | ProviderError::EmptyResponse { provider } => provider,
         }
@@ -122,6 +148,16 @@ impl fmt::Display for ProviderError {
                 status,
                 body,
             } => write!(f, "{provider} call returned {status}: {body}"),
+            ProviderError::Timeout {
+                provider,
+                stage,
+                after,
+            } => write!(
+                f,
+                "{provider} {} timed out after {}s",
+                stage.as_str(),
+                after.as_secs_f64()
+            ),
             ProviderError::Transport { provider, source } => {
                 write!(f, "{provider} transport error: {source}")
             }

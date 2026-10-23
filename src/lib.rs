@@ -15,6 +15,7 @@ mod session;
 mod store;
 mod streaming;
 mod structured;
+mod timeout;
 mod tool;
 mod tool_args;
 
@@ -56,5 +57,6 @@ pub use session::{
 pub use store::{ConversationStore, InMemoryConversationStore};
 pub use streaming::should_flush_delta;
 pub use structured::{ResponseFormat, response_schema_for};
+pub use timeout::{HttpTimeout, TimeoutHttpClient, TimeoutStage, Timeouts};
 pub use tool::{JsonTool, Tool, ToolCall, ToolDefinition, ToolOutput, ToolRegistry};
 pub use tool_args::heal as heal_tool_arguments;
