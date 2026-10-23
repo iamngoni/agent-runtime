@@ -346,6 +346,13 @@ impl AnthropicClient {
                         saw_done = true;
                         break;
                     }
+                    Ok(AnthropicParsedStreamEvent::Error(message)) => {
+                        return Err(ProviderError::Provider {
+                            provider: self.provider_name().to_string(),
+                            message,
+                        }
+                        .into());
+                    }
                     Ok(AnthropicParsedStreamEvent::Empty) => {}
                     Ok(AnthropicParsedStreamEvent::Deltas(deltas)) => {
                         for delta in deltas {
@@ -463,6 +470,8 @@ impl TextProvider for AnthropicClient {
 pub enum AnthropicParsedStreamEvent {
     Deltas(Vec<String>),
     Done,
+    /// An `event: error`, with the provider's own message.
+    Error(String),
     Empty,
 }
 
@@ -487,6 +496,14 @@ pub fn parse_anthropic_stream_event(raw_event: &str) -> Result<AnthropicParsedSt
 
     match event_name.unwrap_or(payload.kind.as_str()) {
         "message_stop" => Ok(AnthropicParsedStreamEvent::Done),
+        "error" => {
+            let message = payload
+                .error
+                .as_ref()
+                .and_then(|error| error.message.clone().or_else(|| error.kind.clone()))
+                .unwrap_or_else(|| payload.kind.clone());
+            Ok(AnthropicParsedStreamEvent::Error(message))
+        }
         "content_block_start" => {
             let delta = payload
                 .content_block
@@ -748,6 +765,16 @@ struct AnthropicStreamEvent {
     content_block: Option<AnthropicStreamContentBlock>,
     #[serde(default)]
     delta: Option<AnthropicStreamDelta>,
+    #[serde(default)]
+    error: Option<AnthropicStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamError {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,6 +804,18 @@ mod tests {
         messages_to_anthropic_json, parse_anthropic_stream_event,
     };
     use crate::{ChatMessage, ToolCall};
+
+    #[test]
+    fn an_error_event_keeps_the_provider_message() -> Result<()> {
+        let parsed = parse_anthropic_stream_event(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"The server is overloaded.\"}}",
+        )?;
+        assert!(matches!(
+            parsed,
+            AnthropicParsedStreamEvent::Error(message) if message.contains("overloaded")
+        ));
+        Ok(())
+    }
 
     #[test]
     fn groups_tool_results_into_user_message() -> Result<()> {

@@ -46,6 +46,9 @@ pub enum ProviderError {
         provider: String,
         source: anyhow::Error,
     },
+    /// The provider reported an error inside an otherwise successful stream
+    /// (Anthropic's `event: error`, for example).
+    Provider { provider: String, message: String },
     /// The response decoded successfully but carried no usable content.
     EmptyResponse { provider: String },
 }
@@ -115,6 +118,7 @@ impl ProviderError {
             ProviderError::RateLimited { provider, .. }
             | ProviderError::InsufficientCredits { provider, .. }
             | ProviderError::Overloaded { provider, .. }
+            | ProviderError::Provider { provider, .. }
             | ProviderError::Status { provider, .. }
             | ProviderError::Timeout { provider, .. }
             | ProviderError::Transport { provider, .. }
@@ -158,6 +162,9 @@ impl fmt::Display for ProviderError {
                 stage.as_str(),
                 after.as_secs_f64()
             ),
+            ProviderError::Provider { provider, message } => {
+                write!(f, "{provider} reported an error: {message}")
+            }
             ProviderError::Transport { provider, source } => {
                 write!(f, "{provider} transport error: {source}")
             }
