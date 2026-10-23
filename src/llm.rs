@@ -18,6 +18,7 @@ use crate::gemini::GeminiClientConfig;
 use crate::http::{HttpClient, SharedHttpClient};
 use crate::openai::{OpenAiClientConfig, StructuredStrategy};
 use crate::provider::{ModelTier, ModelTiers, TextProvider};
+use crate::timeout::{TimeoutHttpClient, Timeouts};
 use crate::{
     Agent, AgentProviderKind, AnthropicClient, AssistantTurn, BedrockClient, ChatMessage,
     CohereClient, EventSink, GeminiClient, NullEventSink, OpenAiClient, ResponseFormat,
@@ -40,6 +41,9 @@ pub struct LlmBuilder {
     extra_headers: Vec<(String, String)>,
     model_tiers: Option<ModelTiers>,
     max_tokens: Option<u32>,
+    max_completion_tokens: Option<u64>,
+    reasoning_effort: Option<String>,
+    timeouts: Timeouts,
     retry: RetryPolicy,
     structured_strategy: StructuredStrategy,
     config: LlmConfig,
@@ -452,6 +456,30 @@ impl LlmBuilder {
         self
     }
 
+    /// Maximum output tokens for OpenAI-compatible providers, sent as
+    /// `max_completion_tokens` (the field newer OpenAI reasoning models
+    /// require instead of the deprecated `max_tokens`).
+    pub fn max_completion_tokens(mut self, max_completion_tokens: u64) -> Self {
+        self.max_completion_tokens = Some(max_completion_tokens);
+        self
+    }
+
+    /// Reasoning effort for models that take one (e.g. `"low"`, `"high"`).
+    /// The wire shape follows the provider; only OpenAI-compatible clients
+    /// read it today.
+    pub fn reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(reasoning_effort.into());
+        self
+    }
+
+    /// Limits applied to every request through any [`HttpClient`] backend.
+    /// Defaults are finite so a silent server fails instead of hanging; see
+    /// [`Timeouts`].
+    pub fn timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
     /// Configure automatic retry with backoff for retryable provider errors
     /// (rate limits, overloads, transport failures). Defaults to no retries.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
@@ -485,8 +513,9 @@ impl LlmBuilder {
         ))?;
         let http_client = match self.http_client {
             Some(client) => client,
-            None => default_http_client()?,
+            None => default_http_client(self.timeouts)?,
         };
+        let http_client = TimeoutHttpClient::new(http_client, self.timeouts).into_shared();
         let model_tiers = self
             .model_tiers
             .unwrap_or_else(|| self.provider.default_model_tiers());
@@ -573,8 +602,8 @@ impl LlmBuilder {
                     model_tiers,
                     retry: self.retry,
                     verbose: self.config.verbose,
-                    max_completion_tokens: None,
-                    reasoning_effort: None,
+                    max_completion_tokens: self.max_completion_tokens,
+                    reasoning_effort: self.reasoning_effort.clone(),
                     structured_strategy: self.structured_strategy,
                 };
                 Arc::new(OpenAiClient::with_config(http_client, api_key, config))
@@ -589,12 +618,12 @@ impl LlmBuilder {
 }
 
 #[cfg(feature = "reqwest-http")]
-fn default_http_client() -> Result<SharedHttpClient> {
-    Ok(crate::ReqwestHttpClient::default().into_shared())
+fn default_http_client(timeouts: Timeouts) -> Result<SharedHttpClient> {
+    Ok(crate::ReqwestHttpClient::with_timeouts(timeouts).into_shared())
 }
 
 #[cfg(not(feature = "reqwest-http"))]
-fn default_http_client() -> Result<SharedHttpClient> {
+fn default_http_client(_timeouts: Timeouts) -> Result<SharedHttpClient> {
     anyhow::bail!(
         "no HTTP backend configured: enable the `reqwest-http` feature or call \
          `LlmBuilder::http_client(...)` with a custom impl"

@@ -5,10 +5,26 @@ use crate::{ToolCall, ToolOutput};
 
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
-    AssistantStarted { model: String },
-    AssistantDelta { delta: String },
-    ToolStarted { call: ToolCall },
-    ToolCompleted { call: ToolCall, output: ToolOutput },
+    AssistantStarted {
+        model: String,
+    },
+    AssistantDelta {
+        delta: String,
+    },
+    /// The assistant stream ended. `complete` is false when the provider
+    /// stopped without its protocol's end marker (`[DONE]`,
+    /// `message_stop`), so a caller can show the answer as cut off instead
+    /// of presenting a truncated reply as finished.
+    AssistantEnded {
+        complete: bool,
+    },
+    ToolStarted {
+        call: ToolCall,
+    },
+    ToolCompleted {
+        call: ToolCall,
+        output: ToolOutput,
+    },
 }
 
 #[async_trait]

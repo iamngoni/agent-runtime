@@ -542,7 +542,8 @@ impl OpenAiClient {
             .http_client
             .send_streaming(request)
             .await
-            .context("failed to call chat completions for streamed message")?;
+            .context("failed to call chat completions for streamed message")
+            .map_err(|error| ProviderError::transport(self.provider_name(), error))?;
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
@@ -662,6 +663,8 @@ impl OpenAiClient {
             );
         }
 
+        sink.emit(RuntimeEvent::AssistantEnded { complete: saw_done })
+            .await?;
         Ok(message)
     }
 

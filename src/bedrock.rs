@@ -255,6 +255,8 @@ impl TextProvider for BedrockClient {
             delta: message.clone(),
         })
         .await?;
+        sink.emit(RuntimeEvent::AssistantEnded { complete: true })
+            .await?;
         Ok(message)
     }
 }

@@ -220,7 +220,8 @@ impl CohereClient {
             .http_client
             .send_streaming(request)
             .await
-            .context("failed to call Cohere streaming chat")?;
+            .context("failed to call Cohere streaming chat")
+            .map_err(|error| ProviderError::transport(self.provider_name(), error))?;
 
         if !(200..300).contains(&response.status) {
             let status = response.status;
@@ -294,6 +295,8 @@ impl CohereClient {
             );
         }
 
+        sink.emit(RuntimeEvent::AssistantEnded { complete: true })
+            .await?;
         Ok(message)
     }
 }

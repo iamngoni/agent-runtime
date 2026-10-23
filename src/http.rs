@@ -144,18 +144,45 @@ mod reqwest_impl {
     use async_trait::async_trait;
     use futures_util::TryStreamExt;
     use reqwest::{Client, Method};
+    use std::time::Duration;
+
+    use crate::timeout::{HttpTimeout, TimeoutStage, Timeouts};
 
     use super::{HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpStreamResponse};
 
     /// HTTP backend that uses `reqwest`. The default on native targets.
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     pub struct ReqwestHttpClient {
         client: Client,
+        timeouts: Timeouts,
+    }
+
+    impl Default for ReqwestHttpClient {
+        fn default() -> Self {
+            Self::with_timeouts(Timeouts::default())
+        }
     }
 
     impl ReqwestHttpClient {
+        /// Wrap an existing reqwest client. Timeouts are enforced by the
+        /// caller's `TimeoutHttpClient`; this backend leaves the client as it
+        /// was built.
         pub fn new(client: Client) -> Self {
-            Self { client }
+            Self {
+                client,
+                timeouts: Timeouts::none(),
+            }
+        }
+
+        /// Build a client that applies [`Timeouts::connect`] at the socket
+        /// level, and reports reqwest timeouts as typed [`HttpTimeout`]s.
+        pub fn with_timeouts(timeouts: Timeouts) -> Self {
+            let mut builder = Client::builder();
+            if let Some(connect) = timeouts.connect {
+                builder = builder.connect_timeout(connect);
+            }
+            let client = builder.build().unwrap_or_default();
+            Self { client, timeouts }
         }
 
         /// Reach the underlying `reqwest::Client` for callers that still want
@@ -169,6 +196,30 @@ mod reqwest_impl {
         pub fn into_shared(self) -> Arc<dyn HttpClient> {
             Arc::new(self)
         }
+
+        /// Classify reqwest's own timeout errors, so a connect timeout is
+        /// still a typed [`HttpTimeout`] before the outer timeout wrapper
+        /// sees it.
+        fn transport_error(&self, error: reqwest::Error) -> anyhow::Error {
+            classify_transport_error(error, self.timeouts)
+        }
+    }
+
+    /// Kept free so a stream mapping closure needn't borrow the client (and
+    /// therefore outlive the response).
+    fn classify_transport_error(error: reqwest::Error, timeouts: Timeouts) -> anyhow::Error {
+        if error.is_timeout() {
+            let (stage, after) = if error.is_connect() {
+                (TimeoutStage::Connect, timeouts.connect)
+            } else {
+                (TimeoutStage::ResponseHeaders, timeouts.response_headers)
+            };
+            return anyhow!(HttpTimeout {
+                stage,
+                after: after.unwrap_or(Duration::ZERO),
+            });
+        }
+        error.into()
     }
 
     fn convert_method(method: HttpMethod) -> Method {
@@ -198,6 +249,7 @@ mod reqwest_impl {
             let response = build_request(&self.client, request)
                 .send()
                 .await
+                .map_err(|error| self.transport_error(error))
                 .context("HTTP request failed")?;
             let status = response.status().as_u16();
             let body = response
@@ -212,12 +264,16 @@ mod reqwest_impl {
             let response = build_request(&self.client, request)
                 .send()
                 .await
+                .map_err(|error| self.transport_error(error))
                 .context("HTTP streaming request failed")?;
             let status = response.status().as_u16();
+            let timeouts = self.timeouts;
             let stream = response
                 .bytes_stream()
                 .map_ok(|bytes| bytes.to_vec())
-                .map_err(|err| anyhow!("stream read failed: {err}"));
+                .map_err(move |err| {
+                    classify_transport_error(err, timeouts).context("stream read failed")
+                });
             Ok(HttpStreamResponse {
                 status,
                 body: Box::pin(stream),

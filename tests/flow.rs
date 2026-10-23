@@ -11,7 +11,7 @@ use agent_runtime::ResponseFormat;
 use agent_runtime::{
     Agent, AgentProviderKind, AgentTool, ChatMessage, EventSink, HttpByteStream, HttpClient,
     HttpRequest, HttpResponse, HttpStreamResponse, JsonTool, Llm, RetryPolicy, RuntimeEvent,
-    ToolRegistry, ToolSessionOutcome, ToolSessionRequest,
+    Timeouts, ToolRegistry, ToolSessionOutcome, ToolSessionRequest,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -743,5 +743,282 @@ async fn surfaces_non_retryable_errors() -> Result<()> {
 
     assert!(result.is_err());
     assert_eq!(mock.request_count(), 1); // no retry on 400
+    Ok(())
+}
+
+/// A client whose streaming call answers headers and then hangs forever. The
+/// guard signals when the body stream is dropped, proving cancellation reaches
+/// the transport.
+struct HangingStream {
+    started: Arc<tokio::sync::Notify>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl HttpClient for HangingStream {
+    async fn send(&self, _request: HttpRequest) -> Result<HttpResponse> {
+        Err(anyhow::anyhow!("buffered call unused"))
+    }
+
+    async fn send_streaming(&self, _request: HttpRequest) -> Result<HttpStreamResponse> {
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let guard = Guard(self.dropped.clone());
+        let started = self.started.clone();
+        let body = stream::once(async move {
+            started.notify_one();
+            let _guard = guard;
+            std::future::pending::<Result<Vec<u8>>>().await
+        });
+        Ok(HttpStreamResponse {
+            status: 200,
+            body: Box::pin(body),
+        })
+    }
+}
+
+#[tokio::test]
+async fn dropping_a_stream_aborts_the_request() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let client = HangingStream {
+        started: started.clone(),
+        dropped: dropped.clone(),
+    };
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .with_http_client(client)
+        .timeouts(agent_runtime::Timeouts::none())
+        .build()?;
+
+    let task = tokio::spawn(async move {
+        let mut sink = RecordingSink::default();
+        let _ = llm
+            .stream_message("gpt-4o", "be brief", &[ChatMessage::user("hi")], &mut sink)
+            .await;
+    });
+
+    started.notified().await;
+    task.abort();
+    let _ = task.await;
+    // Give the aborted task's destructors a moment to run.
+    for _ in 0..100 {
+        if dropped.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "dropping the stream must drop the response body"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_silent_server_is_a_typed_timeout_not_a_hang() {
+    struct Silent;
+    #[async_trait]
+    impl HttpClient for Silent {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse> {
+            std::future::pending().await
+        }
+        async fn send_streaming(&self, _request: HttpRequest) -> Result<HttpStreamResponse> {
+            std::future::pending().await
+        }
+    }
+
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .with_http_client(Silent)
+        .timeouts(
+            agent_runtime::Timeouts::none().response(Some(std::time::Duration::from_millis(30))),
+        )
+        .build()
+        .expect("llm builds");
+
+    let error = llm
+        .request_assistant_turn("gpt-4o", "sys", &[ChatMessage::user("hi")], &[])
+        .await
+        .expect_err("a silent server must fail");
+    let provider_error = error
+        .chain()
+        .find_map(|error| error.downcast_ref::<agent_runtime::ProviderError>())
+        .expect("typed provider error");
+    assert!(matches!(
+        provider_error,
+        agent_runtime::ProviderError::Timeout {
+            stage: agent_runtime::TimeoutStage::Response,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_stream_without_its_end_marker_is_reported_as_incomplete() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_stream(
+        200,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n\n",
+    );
+    let llm = build_llm(mock);
+    let mut sink = RecordingSink::default();
+    let message = llm
+        .stream_message("gpt-4o", "be brief", &[ChatMessage::user("hi")], &mut sink)
+        .await?;
+    assert_eq!(message, "half an answer");
+    assert!(matches!(
+        sink.events.last(),
+        Some(RuntimeEvent::AssistantEnded { complete: false })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_complete_stream_is_reported_as_complete() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_stream(
+        200,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+    );
+    let llm = build_llm(mock);
+    let mut sink = RecordingSink::default();
+    llm.stream_message("gpt-4o", "be brief", &[ChatMessage::user("hi")], &mut sink)
+        .await?;
+    assert!(matches!(
+        sink.events.last(),
+        Some(RuntimeEvent::AssistantEnded { complete: true })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn max_completion_tokens_reaches_the_openai_wire() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_buffered(
+        200,
+        json!({ "choices": [{ "message": { "content": "ok" } }] }).to_string(),
+    );
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .with_http_client(mock.clone())
+        .max_completion_tokens(4096)
+        .build()?;
+    llm.request_assistant_turn("gpt-4o", "sys", &[ChatMessage::user("hi")], &[])
+        .await?;
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(
+        sent.contains("\"max_completion_tokens\":4096"),
+        "request body: {sent}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_socket_that_accepts_and_stays_silent_ends_in_a_typed_timeout() -> Result<()> {
+    use std::time::Duration;
+
+    // A real TCP listener: it accepts the connection, reads nothing and never
+    // writes a response, exactly the server that used to hang forever.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("one connection");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(socket);
+    });
+
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .base_url(format!("http://{address}/v1"))
+        .timeouts(Timeouts::none().response(Some(Duration::from_millis(200))))
+        .build()?;
+
+    let started = std::time::Instant::now();
+    let error = llm
+        .request_assistant_turn("gpt-4o", "sys", &[ChatMessage::user("hi")], &[])
+        .await
+        .expect_err("a silent server must time out");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the timeout must fire promptly, not hang"
+    );
+    let provider_error = error
+        .chain()
+        .find_map(|error| error.downcast_ref::<agent_runtime::ProviderError>())
+        .expect("typed provider error");
+    assert!(matches!(
+        provider_error,
+        agent_runtime::ProviderError::Timeout {
+            stage: agent_runtime::TimeoutStage::Response,
+            ..
+        }
+    ));
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_the_streaming_future_drops_the_transport_future() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct HangingFuture {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl HttpClient for HangingFuture {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse> {
+            Err(anyhow::anyhow!("buffered call unused"))
+        }
+
+        async fn send_streaming(&self, _request: HttpRequest) -> Result<HttpStreamResponse> {
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending::<Result<HttpStreamResponse>>().await
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let llm = Llm::builder()
+        .provider(AgentProviderKind::OpenAi)
+        .api_key("test-key")
+        .with_http_client(HangingFuture {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        })
+        .timeouts(Timeouts::none())
+        .build()?;
+
+    let mut sink = RecordingSink::default();
+    let messages = [ChatMessage::user("hi")];
+    let mut future = Box::pin(llm.stream_message("gpt-4o", "be brief", &messages, &mut sink));
+    tokio::select! {
+        _ = &mut future => panic!("the transport must not answer"),
+        _ = started.notified() => {}
+    }
+    drop(future);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "dropping the streaming future must drop the transport future"
+    );
     Ok(())
 }
