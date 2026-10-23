@@ -1022,3 +1022,165 @@ async fn dropping_the_streaming_future_drops_the_transport_future() -> Result<()
     );
     Ok(())
 }
+
+fn build_llm_for(
+    mock: MockHttpClient,
+    provider: AgentProviderKind,
+    max_completion_tokens: Option<u64>,
+) -> Llm {
+    let mut builder = Llm::builder()
+        .provider(provider)
+        .api_key("test-key")
+        .with_http_client(mock);
+    if let Some(cap) = max_completion_tokens {
+        builder = builder.max_completion_tokens(cap);
+    }
+    builder.build().expect("llm builds")
+}
+
+/// Anthropic rejects a follow-up carrying `tool_use`/`tool_result` blocks
+/// unless the request also declares `tools`. The streamed synthesis after a
+/// tool call must include them (with `tool_choice: none`).
+#[tokio::test]
+async fn anthropic_followup_after_a_tool_call_declares_the_tools() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_buffered(
+        200,
+        json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "tool_1",
+                "name": "echo",
+                "input": { "text": "ping" }
+            }],
+            "stop_reason": "tool_use"
+        })
+        .to_string(),
+    );
+    mock.push_stream(
+        200,
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"echoed: ping\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+    );
+
+    let agent = build_llm_for(mock.clone(), AgentProviderKind::Anthropic, None);
+    let mut registry = ToolRegistry::<()>::new();
+    registry.register(JsonTool::new(
+        "echo",
+        "Echo the text back",
+        |_ctx: (), args: EchoArgs| async move { Ok(json!({ "echoed": args.text })) },
+    ));
+
+    let mut sink = RecordingSink::default();
+    let outcome = agent
+        .execute_tool_session(
+            ToolSessionRequest {
+                model: "claude-3-5-sonnet-latest",
+                decision_system_prompt: "decide",
+                followup_system_prompt: "answer",
+                history: &[ChatMessage::user("ping the echo tool")],
+                tool_registry: &registry,
+                tool_context: (),
+                max_tool_calls: 4,
+            },
+            &mut sink,
+        )
+        .await?;
+
+    assert_eq!(outcome.message(), "echoed: ping");
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(sent.contains("\"tools\""), "request body: {sent}");
+    assert!(sent.contains("echo"), "request body: {sent}");
+    assert!(
+        sent.contains("\"tool_choice\":{\"type\":\"none\"}"),
+        "request body: {sent}"
+    );
+    Ok(())
+}
+
+/// Bedrock Converse rejects `toolUse`/`toolResult` blocks unless the request
+/// carries `toolConfig`; the follow-up must keep the definitions.
+#[tokio::test]
+async fn bedrock_followup_after_a_tool_call_declares_the_tools() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_buffered(
+        200,
+        json!({
+            "output": { "message": { "role": "assistant", "content": [{
+                "toolUse": { "toolUseId": "tool_1", "name": "echo", "input": { "text": "ping" } }
+            }] } }
+        })
+        .to_string(),
+    );
+    mock.push_buffered(
+        200,
+        json!({
+            "output": { "message": { "role": "assistant", "content": [{ "text": "echoed: ping" }] } }
+        })
+        .to_string(),
+    );
+
+    let agent = build_llm_for(mock.clone(), AgentProviderKind::Bedrock, None);
+    let mut registry = ToolRegistry::<()>::new();
+    registry.register(JsonTool::new(
+        "echo",
+        "Echo the text back",
+        |_ctx: (), args: EchoArgs| async move { Ok(json!({ "echoed": args.text })) },
+    ));
+
+    let mut sink = RecordingSink::default();
+    let outcome = agent
+        .execute_tool_session(
+            ToolSessionRequest {
+                model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                decision_system_prompt: "decide",
+                followup_system_prompt: "answer",
+                history: &[ChatMessage::user("ping the echo tool")],
+                tool_registry: &registry,
+                tool_context: (),
+                max_tool_calls: 4,
+            },
+            &mut sink,
+        )
+        .await?;
+
+    assert_eq!(outcome.message(), "echoed: ping");
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(sent.contains("\"toolConfig\""), "request body: {sent}");
+    assert!(sent.contains("echo"), "request body: {sent}");
+    Ok(())
+}
+
+/// Mistral's chat-completions API documents `max_tokens`, not
+/// `max_completion_tokens`; a recorded request must use the documented field.
+#[tokio::test]
+async fn mistral_takes_max_tokens_on_the_wire() -> Result<()> {
+    let mock = MockHttpClient::new();
+    mock.push_stream(
+        200,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+    );
+    let agent = build_llm_for(mock.clone(), AgentProviderKind::Mistral, Some(1024));
+
+    let mut sink = RecordingSink::default();
+    agent
+        .stream_message(
+            "mistral-small-latest",
+            "be brief",
+            &[ChatMessage::user("hi")],
+            &mut sink,
+        )
+        .await?;
+
+    let sent = String::from_utf8(mock.last_request_body()).unwrap();
+    assert!(sent.contains("\"max_tokens\":1024"), "request body: {sent}");
+    assert!(
+        !sent.contains("max_completion_tokens"),
+        "request body: {sent}"
+    );
+    Ok(())
+}

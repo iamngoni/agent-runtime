@@ -198,11 +198,19 @@ impl OpenAiClient {
         request
     }
 
-    /// Insert `max_completion_tokens` into a request body when configured.
-    /// See [`OpenAiClientConfig::max_completion_tokens`].
+    /// Insert the configured output-token cap into a request body when
+    /// configured. OpenAI's newer reasoning models want
+    /// `max_completion_tokens`; Mistral's chat-completions API documents only
+    /// `max_tokens`, so send that there. See
+    /// [`OpenAiClientConfig::max_completion_tokens`].
     fn apply_max_completion_tokens(&self, payload: &mut Map<String, Value>) {
         if let Some(cap) = self.config.max_completion_tokens {
-            payload.insert("max_completion_tokens".to_string(), json!(cap));
+            let field = if self.config.kind == AgentProviderKind::Mistral {
+                "max_tokens"
+            } else {
+                "max_completion_tokens"
+            };
+            payload.insert(field.to_string(), json!(cap));
         }
     }
 
@@ -1251,6 +1259,17 @@ mod tests {
             OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", without_cap);
         let mut payload = Map::new();
         client.apply_max_completion_tokens(&mut payload);
+        assert!(!payload.contains_key("max_completion_tokens"));
+    }
+
+    #[test]
+    fn mistral_takes_the_documented_max_tokens_field() {
+        let mut config = OpenAiClientConfig::for_kind(AgentProviderKind::Mistral);
+        config.max_completion_tokens = Some(1024);
+        let client = OpenAiClient::with_config(std::sync::Arc::new(NoopHttpClient), "key", config);
+        let mut payload = Map::new();
+        client.apply_max_completion_tokens(&mut payload);
+        assert_eq!(payload.get("max_tokens"), Some(&json!(1024)));
         assert!(!payload.contains_key("max_completion_tokens"));
     }
 

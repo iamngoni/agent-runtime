@@ -268,6 +268,7 @@ impl AnthropicClient {
         model: &str,
         system_prompt: &str,
         messages: &[ChatMessage],
+        tool_definitions: &[ToolDefinition],
         sink: &mut dyn EventSink,
     ) -> Result<String> {
         let request_started_at = Instant::now();
@@ -287,13 +288,24 @@ impl AnthropicClient {
             );
         }
 
-        let request_payload = json!({
-            "model": model,
-            "max_tokens": self.config.max_tokens,
-            "stream": true,
-            "system": system_prompt,
-            "messages": anthropic_messages,
-        });
+        let mut request_payload = Map::new();
+        request_payload.insert("model".to_string(), json!(model));
+        request_payload.insert("max_tokens".to_string(), json!(self.config.max_tokens));
+        request_payload.insert("stream".to_string(), json!(true));
+        request_payload.insert("system".to_string(), json!(system_prompt));
+        request_payload.insert("messages".to_string(), Value::Array(anthropic_messages));
+        if !tool_definitions.is_empty() {
+            // A follow-up after a tool call still carries `tool_use` and
+            // `tool_result` blocks; Anthropic rejects those unless the request
+            // also declares the tools. `tool_choice: none` keeps this turn an
+            // answer rather than another round of calls.
+            request_payload.insert(
+                "tools".to_string(),
+                Value::Array(anthropic_tools(tool_definitions)),
+            );
+            request_payload.insert("tool_choice".to_string(), json!({ "type": "none" }));
+        }
+        let request_payload = Value::Object(request_payload);
 
         let request = self
             .prepare(HttpRequest::post(self.config.messages_url()))
@@ -450,7 +462,19 @@ impl TextProvider for AnthropicClient {
         messages: &[ChatMessage],
         sink: &mut dyn EventSink,
     ) -> Result<String> {
-        self.stream_message_impl(model, system_prompt, messages, sink)
+        self.stream_message_impl(model, system_prompt, messages, &[], sink)
+            .await
+    }
+
+    async fn stream_message_with_tools(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tool_definitions: &[ToolDefinition],
+        sink: &mut dyn EventSink,
+    ) -> Result<String> {
+        self.stream_message_impl(model, system_prompt, messages, tool_definitions, sink)
             .await
     }
 
