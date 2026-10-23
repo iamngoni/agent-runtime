@@ -840,8 +840,7 @@ async fn a_silent_server_is_a_typed_timeout_not_a_hang() {
         .api_key("test-key")
         .with_http_client(Silent)
         .timeouts(
-            agent_runtime::Timeouts::none()
-                .response_headers(Some(std::time::Duration::from_millis(30))),
+            agent_runtime::Timeouts::none().response(Some(std::time::Duration::from_millis(30))),
         )
         .build()
         .expect("llm builds");
@@ -857,7 +856,7 @@ async fn a_silent_server_is_a_typed_timeout_not_a_hang() {
     assert!(matches!(
         provider_error,
         agent_runtime::ProviderError::Timeout {
-            stage: agent_runtime::TimeoutStage::ResponseHeaders,
+            stage: agent_runtime::TimeoutStage::Response,
             ..
         }
     ));
@@ -942,7 +941,7 @@ async fn a_real_socket_that_accepts_and_stays_silent_ends_in_a_typed_timeout() -
         .provider(AgentProviderKind::OpenAi)
         .api_key("test-key")
         .base_url(format!("http://{address}/v1"))
-        .timeouts(Timeouts::none().response_headers(Some(Duration::from_millis(200))))
+        .timeouts(Timeouts::none().response(Some(Duration::from_millis(200))))
         .build()?;
 
     let started = std::time::Instant::now();
@@ -961,7 +960,7 @@ async fn a_real_socket_that_accepts_and_stays_silent_ends_in_a_typed_timeout() -
     assert!(matches!(
         provider_error,
         agent_runtime::ProviderError::Timeout {
-            stage: agent_runtime::TimeoutStage::ResponseHeaders,
+            stage: agent_runtime::TimeoutStage::Response,
             ..
         }
     ));

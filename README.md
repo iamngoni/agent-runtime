@@ -221,13 +221,17 @@ let llm = Llm::builder()
     .api_key("…")
     .timeouts(Timeouts::default()
         .connect(Some(Duration::from_secs(10)))          // reqwest connect
-        .response_headers(Some(Duration::from_secs(30))) // status + headers
+        .response_headers(Some(Duration::from_secs(30))) // streamed: status + headers
+        .response(Some(Duration::from_secs(300)))        // buffered: the whole reply
         .idle(Some(Duration::from_secs(60)))             // between chunks
         .total(Some(Duration::from_secs(180))))          // optional deadline
     .build()?;
 ```
 
-`response_headers` and `idle` are defaults, not opt-ins; the reqwest backend
+`response_headers`, `response` (600 s) and `idle` are defaults, not opt-ins. A
+buffered call gets `response` rather than `response_headers`, because a server
+sends a non-streamed reply's headers only after generating all of it. A stream
+that times out reports the timeout once and then ends; the reqwest backend
 honours `connect` at the socket level and maps its own timeout errors onto the
 same typed error. Dropping a `stream_message` future (or a stream body) drops
 the response and aborts the request promptly — cancel by dropping.

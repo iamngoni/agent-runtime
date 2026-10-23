@@ -2,7 +2,7 @@
 //!
 //! The transport trait itself has no notion of time: a backend may hang on
 //! connect, on the response headers, or between streamed chunks. [`Timeouts`]
-//! describes the four limits callers care about, and [`TimeoutHttpClient`]
+//! describes the limits callers care about, and [`TimeoutHttpClient`]
 //! applies them around whatever backend is plugged in — including custom
 //! `wasm` ones that cannot set a timeout themselves. The bundled reqwest
 //! backend additionally maps its own connect/read timeouts onto the same typed
@@ -30,8 +30,10 @@ use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Sha
 pub enum TimeoutStage {
     /// Opening the connection (reported by the reqwest backend).
     Connect,
-    /// Waiting for the response status and headers.
+    /// Waiting for the response status and headers of a streamed call.
     ResponseHeaders,
+    /// Waiting for the whole response of a buffered (non-streamed) call.
+    Response,
     /// Waiting for the next chunk of a streamed body.
     Idle,
     /// The optional overall deadline for the whole call.
@@ -43,6 +45,7 @@ impl TimeoutStage {
         match self {
             TimeoutStage::Connect => "connect",
             TimeoutStage::ResponseHeaders => "response headers",
+            TimeoutStage::Response => "response",
             TimeoutStage::Idle => "idle",
             TimeoutStage::Total => "total",
         }
@@ -79,7 +82,13 @@ impl std::error::Error for HttpTimeout {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub connect: Option<Duration>,
+    /// Status and headers of a streamed call, which arrive before generation.
     pub response_headers: Option<Duration>,
+    /// The whole body of a buffered call. Servers answer those only after
+    /// generating everything, so this is generation time and is much longer
+    /// than `response_headers`.
+    pub response: Option<Duration>,
+    /// Between chunks of a streamed body.
     pub idle: Option<Duration>,
     pub total: Option<Duration>,
 }
@@ -89,6 +98,7 @@ impl Default for Timeouts {
         Self {
             connect: Some(Duration::from_secs(15)),
             response_headers: Some(Duration::from_secs(60)),
+            response: Some(Duration::from_secs(600)),
             idle: Some(Duration::from_secs(120)),
             total: None,
         }
@@ -101,6 +111,7 @@ impl Timeouts {
         Self {
             connect: None,
             response_headers: None,
+            response: None,
             idle: None,
             total: None,
         }
@@ -113,6 +124,11 @@ impl Timeouts {
 
     pub fn response_headers(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.response_headers = timeout.into();
+        self
+    }
+
+    pub fn response(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.response = timeout.into();
         self
     }
 
@@ -131,14 +147,23 @@ impl Timeouts {
     /// one that actually elapsed, so a total deadline stays non-retryable
     /// even when it fires before the headers arrive.
     fn headers_limit(&self) -> Option<(TimeoutStage, Duration)> {
-        [
+        self.tighter(
             self.response_headers
                 .map(|after| (TimeoutStage::ResponseHeaders, after)),
-            self.total.map(|after| (TimeoutStage::Total, after)),
-        ]
-        .into_iter()
-        .flatten()
-        .min_by(|a, b| a.1.cmp(&b.1))
+        )
+    }
+
+    /// The limit on a buffered call: the tighter of the response limit and
+    /// the optional overall deadline.
+    fn buffered_limit(&self) -> Option<(TimeoutStage, Duration)> {
+        self.tighter(self.response.map(|after| (TimeoutStage::Response, after)))
+    }
+
+    fn tighter(&self, limit: Option<(TimeoutStage, Duration)>) -> Option<(TimeoutStage, Duration)> {
+        [limit, self.total.map(|after| (TimeoutStage::Total, after))]
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| a.1.cmp(&b.1))
     }
 }
 
@@ -189,6 +214,7 @@ fn timeout_stream(
 ) -> crate::http::HttpByteStream {
     struct State {
         inner: crate::http::HttpByteStream,
+        timed_out: bool,
         idle: Option<Duration>,
         total: Option<(TimeoutStage, Duration)>,
         started_at: Instant,
@@ -197,15 +223,21 @@ fn timeout_stream(
     Box::pin(stream::unfold(
         State {
             inner,
+            timed_out: false,
             idle,
             total,
             started_at,
         },
         |mut state| async move {
+            // A timed-out stream is over: report the timeout once, then end.
+            if state.timed_out {
+                return None;
+            }
             let total_left = match state.total {
                 Some((stage, after)) => {
                     let elapsed = state.started_at.elapsed();
                     if elapsed >= after {
+                        state.timed_out = true;
                         return Some((Err(anyhow!(HttpTimeout { stage, after })), state));
                     }
                     Some((stage, after - elapsed))
@@ -223,15 +255,17 @@ fn timeout_stream(
             match limit {
                 None => state.inner.next().await.map(|chunk| (chunk, state)),
                 Some((stage, after)) => {
-                    let next = Box::pin(state.inner.next());
-                    let timer = Box::pin(Delay::new(after));
-                    match select(next, timer).await {
-                        Either::Left((Some(chunk), _)) => Some((chunk, state)),
-                        Either::Left((None, _)) => None,
-                        Either::Right(((), _)) => {
-                            Some((Err(anyhow!(HttpTimeout { stage, after })), state))
+                    let timed_out = {
+                        let next = Box::pin(state.inner.next());
+                        let timer = Box::pin(Delay::new(after));
+                        match select(next, timer).await {
+                            Either::Left((Some(chunk), _)) => return Some((chunk, state)),
+                            Either::Left((None, _)) => return None,
+                            Either::Right(((), _)) => HttpTimeout { stage, after },
                         }
-                    }
+                    };
+                    state.timed_out = true;
+                    Some((Err(anyhow!(timed_out)), state))
                 }
             }
         },
@@ -241,10 +275,10 @@ fn timeout_stream(
 #[async_trait]
 impl HttpClient for TimeoutHttpClient {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
-        // A buffered call has no chunks to reset an idle timer on; the header
-        // limit bounds the whole request, and the total deadline can only
-        // shorten it.
-        with_timeout(self.inner.send(request), self.timeouts.headers_limit()).await
+        // A buffered call has no chunks to reset an idle timer on, and its
+        // headers come only after the whole answer is generated, so the
+        // response limit bounds it; the total deadline can only shorten it.
+        with_timeout(self.inner.send(request), self.timeouts.buffered_limit()).await
     }
 
     async fn send_streaming(&self, request: HttpRequest) -> Result<HttpStreamResponse> {
@@ -325,11 +359,54 @@ mod tests {
             Timeouts::none().response_headers(Some(Duration::from_millis(30))),
         );
         let error = client
+            .send_streaming(HttpRequest::post("http://example.test"))
+            .await
+            .err()
+            .expect("a silent server must time out");
+        let timeout = timeout_of(&error);
+        assert_eq!(timeout.stage, super::TimeoutStage::ResponseHeaders);
+    }
+
+    #[tokio::test]
+    async fn a_buffered_call_gets_the_response_limit_not_the_header_limit() {
+        let client = TimeoutHttpClient::new(
+            Arc::new(Silent),
+            Timeouts::none()
+                .response_headers(Some(Duration::from_millis(5)))
+                .response(Some(Duration::from_millis(40))),
+        );
+        let started = std::time::Instant::now();
+        let error = client
             .send(HttpRequest::post("http://example.test"))
             .await
             .expect_err("a silent server must time out");
-        let timeout = timeout_of(&error);
-        assert_eq!(timeout.stage, super::TimeoutStage::ResponseHeaders);
+        assert_eq!(timeout_of(&error).stage, super::TimeoutStage::Response);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn default_buffered_limit_outlasts_the_header_limit() {
+        let timeouts = Timeouts::default();
+        assert!(timeouts.response > timeouts.response_headers);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_stream_reports_once_then_ends() {
+        let client = TimeoutHttpClient::new(
+            Arc::new(StallsAfterFirstChunk),
+            Timeouts::none().idle(Some(Duration::from_millis(20))),
+        );
+        let mut body = client
+            .send_streaming(HttpRequest::post("http://example.test"))
+            .await
+            .expect("headers arrive")
+            .body;
+        assert!(body.next().await.unwrap().is_ok());
+        assert!(body.next().await.unwrap().is_err());
+        assert!(
+            body.next().await.is_none(),
+            "the stream ends after a timeout"
+        );
     }
 
     #[tokio::test]
